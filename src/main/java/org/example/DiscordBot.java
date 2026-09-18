@@ -15,6 +15,8 @@ import net.dv8tion.jda.api.interactions.commands.OptionMapping;
 import net.dv8tion.jda.api.interactions.commands.build.Commands;
 import net.dv8tion.jda.api.interactions.commands.build.OptionData;
 import net.dv8tion.jda.api.interactions.components.buttons.Button;
+import net.dv8tion.jda.api.entities.MessageEmbed;
+import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
 import net.dv8tion.jda.api.requests.GatewayIntent;
 
 import java.util.EnumSet;
@@ -25,7 +27,9 @@ import static net.dv8tion.jda.api.interactions.commands.OptionType.*;
 
 public class DiscordBot extends ListenerAdapter {
 
-    BackgroundThread thread;
+    private final BungieClient bungie = new BungieClient();
+    private final ManifestCache manifest = new ManifestCache(bungie);
+    private BackgroundThread watcher;
 
     public static void main(String[] args) {
         JDA jda = JDABuilder.createLight(Config.require("DISCORD_BOT_TOKEN"), EnumSet.noneOf(GatewayIntent.class))
@@ -57,7 +61,19 @@ public class DiscordBot extends ListenerAdapter {
                         .setGuildOnly(true)
                         .setDefaultPermissions(DefaultMemberPermissions.enabledFor(Permission.MESSAGE_MANAGE)),
 
-                Commands.slash("d2java", "Test D2 BOT in Java")
+                Commands.slash("item", "Look up a Destiny item by its manifest hash")
+                        .addOption(STRING, "hash", "Item hash — find it in a light.gg or Armory URL", true),
+
+                Commands.slash("weekly", "Show the milestones currently active this week"),
+
+                Commands.slash("news", "The latest articles from Bungie.net"),
+
+                Commands.slash("profile", "Look up a player's lifetime PvE stats")
+                        .addOption(STRING, "name", "Bungie name, e.g. Guardian#1234", true),
+
+                Commands.slash("watch", "Announce the weekly rotation in this channel when it changes")
+                        .setGuildOnly(true)
+                        .setDefaultPermissions(DefaultMemberPermissions.enabledFor(Permission.MANAGE_CHANNEL))
         ).queue();
     }
 
@@ -83,9 +99,20 @@ public class DiscordBot extends ListenerAdapter {
             case "prune": // 2 stage command with a button prompt
                 prune(event);
                 break;
-            case "d2java":
-                event.deferReply(true).queue();
-                test(event);
+            case "item":
+                destiny(event, false, () -> Destiny.item(bungie, manifest, event.getOption("hash").getAsString()));
+                break;
+            case "weekly":
+                destiny(event, false, () -> Destiny.weekly(bungie, manifest));
+                break;
+            case "news":
+                destiny(event, false, () -> Destiny.news(bungie));
+                break;
+            case "profile":
+                destiny(event, false, () -> Destiny.profile(bungie, event.getOption("name").getAsString()));
+                break;
+            case "watch":
+                watch(event);
                 break;
             case "shaders":
                 event.reply("I'll shade you").setEphemeral(true).queue();
@@ -189,24 +216,56 @@ public class DiscordBot extends ListenerAdapter {
                 .queue();
     }
 
-    public void test(SlashCommandInteractionEvent event) {
-        BungieClient client = new BungieClient();
-        try {
-            String test = client.sendRequest();
-//            event.getHook().sendMessage(test).queue();
+    /** Something that builds an embed and may fail talking to Bungie. */
+    @FunctionalInterface
+    private interface EmbedSupplier {
+        MessageEmbed get() throws Exception;
+    }
 
-            var guild = event.getGuild();
-
-            if (thread == null) {
-                thread = new BackgroundThread(guild);
-                thread.start();
-            } else {
-                thread.guild = guild;
+    /**
+     * Runs a Bungie-backed command off the event thread.
+     *
+     * <p>JDA gives you three seconds to acknowledge an interaction, and a manifest lookup
+     * can take longer than that, so every one of these defers first and follows up. The
+     * work then happens on a separate thread rather than blocking JDA's event loop.
+     */
+    private void destiny(SlashCommandInteractionEvent event, boolean ephemeral, EmbedSupplier supplier)
+    {
+        event.deferReply(ephemeral).queue();
+        Thread.ofVirtual().start(() -> {
+            try
+            {
+                event.getHook().sendMessageEmbeds(supplier.get()).queue();
             }
+            catch (Exception e)
+            {
+                event.getHook()
+                        .sendMessageEmbeds(Destiny.error("Couldn't reach Bungie: " + e.getMessage()))
+                        .queue();
+            }
+        });
+    }
 
-        } catch (Exception e) {
-            event.getHook().sendMessage("A fatal error occurred...").queue();
+    /** Starts the milestone watcher in the channel the command was used in. */
+    private void watch(SlashCommandInteractionEvent event)
+    {
+        if (!event.getChannel().getType().isMessage() || event.getChannelType().isThread())
+        {
+            event.reply("Use this in a normal text channel.").setEphemeral(true).queue();
+            return;
         }
+
+        TextChannel channel = event.getChannel().asTextChannel();
+        if (watcher != null && watcher.isAlive())
+        {
+            watcher.interrupt();
+        }
+
+        watcher = new BackgroundThread(channel, bungie, manifest);
+        watcher.start();
+        event.reply("Watching for the weekly reset. I'll post here when the rotation changes.")
+                .setEphemeral(true)
+                .queue();
     }
 }
 

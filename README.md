@@ -4,13 +4,37 @@ A Discord bot written in Java with [JDA](https://github.com/discord-jda/JDA), pl
 small client for the [Bungie](https://bungie-net.github.io/) API. Written to learn the
 JDA library and to have something to point Destiny 2 questions at.
 
-## What's in it
+## Commands
 
-- Slash commands registered at startup, including moderation commands gated behind
-  Discord's own permission model (`BAN_MEMBERS` rather than a hand-rolled check)
-- Button interactions with a confirm step, so destructive actions need two clicks
-- A background thread for recurring work, kept off the event thread
-- A Bungie API client that looks up item data from the Destiny manifest
+| Command | What it does |
+| --- | --- |
+| `/item <hash>` | Look up a Destiny item by its manifest hash |
+| `/weekly` | The milestones currently active this week |
+| `/news` | The latest articles from Bungie.net |
+| `/profile <name>` | Lifetime PvE stats for a Bungie name, e.g. `Guardian#1234` |
+| `/watch` | Announce the weekly rotation in this channel when it changes |
+| `/ban`, `/say`, `/leave`, `/prune` | Moderation and utility commands |
+
+## Notes on the Bungie API
+
+**Everything here works with an API key alone.** Anything under `/Destiny2/Actions/` —
+equipping items, transferring, loadouts — needs a full OAuth flow, which this does not
+implement.
+
+**Item lookup takes a hash rather than a name.** Bungie documents a search endpoint at
+`/Destiny2/Armory/Search/{type}/{term}/`, but it returns `NotFound` for every query and
+appears to have been retired without the docs catching up. The alternative is the item
+definition component of the manifest, which is roughly 200 MB — too much for a bot this
+size to hold. Item hashes are visible in the URL of any item page on light.gg or Bungie's
+own Armory.
+
+**Definitions are cached in memory.** Most of the API identifies things by hash, so
+rendering a milestone list means a lookup per hash. `ManifestCache` keeps them for the
+life of the process, since definitions only change when the game patches.
+
+**Lookups can return success with no body.** A hash that no longer exists comes back as
+`ErrorCode 1, "Ok"` with no `Response` at all rather than an error, so the client treats a
+missing payload as a failure.
 
 ## Configuration
 
