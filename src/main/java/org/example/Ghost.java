@@ -44,6 +44,12 @@ final class Ghost {
 
     /** Profile components: vault, characters, character inventories, equipment, activities. */
     private static final String INVENTORY_COMPONENTS = "102,200,201,205";
+    /** Equipment plus the socket state that holds perks, mods, shaders and subclass choices. */
+    private static final String EQUIPMENT_COMPONENTS = "205,305";
+    /** The subclass bucket, called out separately when printing a set. */
+    private static final long SUBCLASS_BUCKET = 3284755031L;
+    /** A ceiling on plug writes per equip, so a wildly stale set cannot run away. */
+    private static final int MAX_PLUG_WRITES = 60;
     private static final String ACTIVITY_COMPONENTS = "200,204";
 
     /** Bungie refuses the action because the player is in an activity. */
@@ -55,7 +61,7 @@ final class Ghost {
     private static final long RENEW_MARGIN = 120;
 
     private final BungieClient client;
-    private final ManifestCache manifest;
+    private final Manifest manifest;
     private final Store store;
 
     /** Discord user id to the state nonce issued by the most recent {@code /link}. */
@@ -63,7 +69,7 @@ final class Ghost {
 
     private static final SecureRandom RANDOM = new SecureRandom();
 
-    Ghost(BungieClient client, ManifestCache manifest, Store store) {
+    Ghost(BungieClient client, Manifest manifest, Store store) {
         this.client = client;
         this.manifest = manifest;
         this.store = store;
@@ -228,12 +234,7 @@ final class Ghost {
     }
 
     private String activityName(long hash) {
-        try {
-            String name = manifest.displayName(ACTIVITY_DEFINITION, hash);
-            return name == null || name.isBlank() ? "Activity " + hash : name;
-        } catch (Exception e) {
-            return "Activity " + hash;
-        }
+        return manifest.activityName(hash);
     }
 
     // ---------------------------------------------------------------- loadouts
@@ -246,12 +247,12 @@ final class Ghost {
             return Destiny.error("Give the loadout a name.");
         }
 
-        JsonObject equipment = child(
-                client.profile(user.membershipType, user.membershipId, "205"),
-                "characterEquipment", "data");
+        JsonObject profile = client.profile(user.membershipType, user.membershipId, EQUIPMENT_COMPONENTS);
+        JsonObject equipment = child(profile, "characterEquipment", "data");
         if (equipment == null || user.characterId == null || !equipment.has(user.characterId)) {
             return Destiny.error("Couldn't read your equipment. Is the character still on the account?");
         }
+        JsonObject socketData = child(profile, "itemComponents", "sockets", "data");
 
         List<Store.Item> items = new ArrayList<>();
         for (JsonElement element : equipment.getAsJsonObject(user.characterId).getAsJsonArray("items")) {
@@ -260,10 +261,13 @@ final class Ghost {
             if (!item.has("itemInstanceId")) {
                 continue;
             }
-            items.add(new Store.Item(
-                    item.get("itemInstanceId").getAsString(),
+            String instanceId = item.get("itemInstanceId").getAsString();
+            Store.Item saved = new Store.Item(
+                    instanceId,
                     item.get("itemHash").getAsLong(),
-                    item.has("bucketHash") ? item.get("bucketHash").getAsLong() : 0));
+                    item.has("bucketHash") ? item.get("bucketHash").getAsLong() : 0);
+            saved.plugs = readPlugs(socketData, instanceId);
+            items.add(saved);
         }
 
         if (items.isEmpty()) {
@@ -274,9 +278,16 @@ final class Ghost {
         user.loadouts.put(name, items);
         store.save();
 
+        int sockets = 0;
+        for (Store.Item item : items) {
+            sockets += item.plugs == null ? 0 : item.plugs.size();
+        }
+
         return simple(replaced ? "Updated " + name : "Saved " + name,
-                items.size() + " items stored by instance id."
-                        + "\n\n`/equip name:" + name + "` to put it back on, or `/map loadout:" + name
+                items.size() + " items stored by instance id, with " + sockets
+                        + " perks, mods and subclass choices."
+                        + "\n\n`/loadout show name:" + name + "` to see it, `/equip name:" + name
+                        + "` to put it back on, or `/map loadout:" + name
                         + "` while in an activity to bind it there.");
     }
 
@@ -312,6 +323,13 @@ final class Ghost {
                 .build();
     }
 
+    /**
+     * Prints a set in full: every item with its type, and what is plugged into it.
+     *
+     * <p>Grouped by slot rather than listed flat, because a loadout is read by slot — and
+     * the subclass is pulled out on its own, since for that item the plugs (super,
+     * abilities, aspects, fragments) are the entire point rather than a detail.
+     */
     MessageEmbed showLoadout(String discordId, String rawName) {
         Store.User user = store.user(discordId);
         String name = normalise(rawName);
@@ -320,24 +338,191 @@ final class Ghost {
             return Destiny.error("No loadout called `" + name + "`.");
         }
 
-        StringBuilder body = new StringBuilder();
+        int plugCount = 0;
         for (Store.Item item : items) {
-            String label;
-            try {
-                label = manifest.displayName(ITEM_DEFINITION, item.itemHash);
-            } catch (Exception e) {
-                label = null;
-            }
-            body.append("• ").append(label == null || label.isBlank() ? "Item " + item.itemHash : label)
-                    .append('\n');
+            plugCount += item.plugs == null ? 0 : item.plugs.size();
         }
 
-        return new EmbedBuilder()
+        EmbedBuilder embed = new EmbedBuilder()
                 .setTitle(name)
                 .setColor(ACCENT)
-                .setDescription(body.toString().trim())
-                .setFooter(items.size() + " items")
-                .build();
+                .setDescription(items.size() + " items" + (plugCount == 0 ? ""
+                        : " · " + plugCount + " perks, mods and subclass choices"));
+
+        // Subclass first: it is the one item whose configuration people actually read.
+        for (Store.Item item : items) {
+            if (item.bucketHash != SUBCLASS_BUCKET) {
+                continue;
+            }
+            List<String> config = plugNames(item);
+            embed.addField(describeItem(item),
+                    config.isEmpty() ? "No configuration saved" : String.join("\n", config), false);
+        }
+
+        // Then the rest, in slot order, with anything plugged into them underneath.
+        for (long bucket : SLOT_ORDER) {
+            List<String> lines = new ArrayList<>();
+            for (Store.Item item : items) {
+                if (item.bucketHash != bucket) {
+                    continue;
+                }
+                lines.add("**" + manifest.itemName(item.itemHash) + "** — " + itemType(item));
+                List<String> plugs = plugNames(item);
+                if (!plugs.isEmpty()) {
+                    lines.add("↳ " + String.join(", ", plugs));
+                }
+            }
+            if (!lines.isEmpty()) {
+                embed.addField(manifest.bucketName(bucket), join(lines), false);
+            }
+        }
+
+        // Anything in a slot not covered above — ghost, sparrow, ship, emblem.
+        List<String> other = new ArrayList<>();
+        for (Store.Item item : items) {
+            if (item.bucketHash == SUBCLASS_BUCKET || contains(SLOT_ORDER, item.bucketHash)) {
+                continue;
+            }
+            other.add("**" + manifest.itemName(item.itemHash) + "** — " + itemType(item));
+        }
+        if (!other.isEmpty()) {
+            embed.addField("Other", join(other), false);
+        }
+
+        String boundTo = String.join(", ", activitiesUsing(user, name));
+        embed.setFooter(boundTo.isEmpty() ? "Not bound to an activity" : "Bound to " + boundTo);
+        return embed.build();
+    }
+
+    /** Weapons, then armour, in the order the game shows them. */
+    private static final long[] SLOT_ORDER = {
+            1498876634L,  // Kinetic
+            2465295065L,  // Energy
+            953998645L,   // Power
+            3448274439L,  // Helmet
+            3551918588L,  // Gauntlets
+            14239492L,    // Chest
+            20886954L,    // Legs
+            1585787867L,  // Class item
+    };
+
+    /** The readable names of whatever is plugged into an item, minus the empty sockets. */
+    private List<String> plugNames(Store.Item item) {
+        List<String> names = new ArrayList<>();
+        if (item.plugs == null) {
+            return names;
+        }
+        for (Long plugHash : item.plugs.values()) {
+            String plug = manifest.itemName(plugHash);
+            // Empty fragment slots and default shaders are noise in a printed set.
+            if (plug.startsWith("Empty") || plug.startsWith("Default")) {
+                continue;
+            }
+            names.add(plug);
+        }
+        return names;
+    }
+
+    private String itemType(Store.Item item) {
+        Manifest.Item definition = manifest.item(item.itemHash);
+        if (definition == null) {
+            return "unknown type";
+        }
+        String detail = ((definition.tier() == null ? "" : definition.tier()) + " "
+                + (definition.type() == null ? "" : definition.type())).trim();
+        return detail.isEmpty() ? "unknown type" : detail;
+    }
+
+    /** The activity names a set is bound to. */
+    private List<String> activitiesUsing(Store.User user, String name) {
+        List<String> names = new ArrayList<>();
+        for (Map.Entry<String, String> entry : user.activityMap.entrySet()) {
+            if (!entry.getValue().equals(name)) {
+                continue;
+            }
+            String activity = activityName(Long.parseLong(entry.getKey()));
+            if (!names.contains(activity)) {
+                names.add(activity);
+            }
+        }
+        return names;
+    }
+
+    private static boolean contains(long[] values, long value) {
+        for (long candidate : values) {
+            if (candidate == value) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Shows the seasonal artifact and which of its perks are switched on.
+     *
+     * <p>Read-only, and not by choice: the artifact has profile and character components but
+     * no action endpoint anywhere in the API, and its perks are progression state rather
+     * than sockets on an instanced item, so there is nothing for the plug endpoints to
+     * address. Unlocking and slotting artifact perks has to happen in game.
+     */
+    MessageEmbed artifact(String discordId) throws IOException {
+        Store.User user = requireLinked(discordId);
+        JsonObject profile = client.profile(user.membershipType, user.membershipId, "104,202");
+
+        JsonObject seasonal = child(profile, "profileProgression", "data", "seasonalArtifact");
+        JsonObject character = child(profile, "characterProgressions", "data");
+        JsonObject mine = character != null && character.has(user.characterId)
+                ? character.getAsJsonObject(user.characterId) : null;
+        JsonObject characterArtifact = mine != null && mine.has("seasonalArtifact")
+                ? mine.getAsJsonObject("seasonalArtifact") : null;
+
+        if (seasonal == null && characterArtifact == null) {
+            return Destiny.error("Couldn't read your artifact.");
+        }
+
+        long artifactHash = seasonal != null && seasonal.has("artifactHash")
+                ? seasonal.get("artifactHash").getAsLong()
+                : characterArtifact.get("artifactHash").getAsLong();
+
+        EmbedBuilder embed = new EmbedBuilder()
+                .setTitle(manifest.itemName(artifactHash))
+                .setColor(ACCENT);
+
+        if (seasonal != null) {
+            embed.addField("Power bonus",
+                    "+" + (seasonal.has("powerBonus") ? seasonal.get("powerBonus").getAsInt() : 0), true);
+            embed.addField("Points earned",
+                    String.valueOf(seasonal.has("pointsAcquired")
+                            ? seasonal.get("pointsAcquired").getAsInt() : 0), true);
+        }
+
+        if (characterArtifact != null) {
+            if (characterArtifact.has("pointsUsed")) {
+                embed.addField("Points spent",
+                        String.valueOf(characterArtifact.get("pointsUsed").getAsInt()), true);
+            }
+            List<String> active = new ArrayList<>();
+            JsonArray tiers = characterArtifact.getAsJsonArray("tiers");
+            if (tiers != null) {
+                for (JsonElement tierElement : tiers) {
+                    JsonArray tierItems = tierElement.getAsJsonObject().getAsJsonArray("items");
+                    if (tierItems == null) {
+                        continue;
+                    }
+                    for (JsonElement itemElement : tierItems) {
+                        JsonObject perk = itemElement.getAsJsonObject();
+                        if (perk.has("isActive") && perk.get("isActive").getAsBoolean()) {
+                            active.add(manifest.itemName(perk.get("itemHash").getAsLong()));
+                        }
+                    }
+                }
+            }
+            embed.addField("Active perks (" + active.size() + ")",
+                    active.isEmpty() ? "None unlocked yet" : join(active), false);
+        }
+
+        embed.setFooter("Read-only — the API has no way to set artifact perks");
+        return embed.build();
     }
 
     MessageEmbed deleteLoadout(String discordId, String rawName) {
@@ -367,10 +552,25 @@ final class Ghost {
 
         long hash;
         if (explicitHash != null && !explicitHash.isBlank()) {
-            try {
-                hash = Long.parseLong(explicitHash.trim());
-            } catch (NumberFormatException e) {
-                return Destiny.error("`" + explicitHash + "` isn't an activity hash.");
+            String activity = explicitHash.trim();
+            if (activity.chars().allMatch(Character::isDigit)) {
+                hash = Long.parseLong(activity);
+            } else {
+                // A name is far easier to type than a hash, and a raid is several hashes —
+                // normal, master, rotator — so bind the set to every one that matches.
+                List<Long> matches = manifest.findActivities(activity);
+                if (matches.isEmpty()) {
+                    return Destiny.error("No activity matching `" + activity + "`."
+                            + (manifest.isReady() ? "" : " The manifest is still loading — try again shortly."));
+                }
+                for (Long match : matches) {
+                    user.activityMap.put(String.valueOf(match), name);
+                }
+                store.save();
+                return simple("Mapped", String.join(", ", manifest.activityNamesMatching(activity))
+                        + " → `" + name + "`"
+                        + "\n\n" + matches.size() + " activity "
+                        + (matches.size() == 1 ? "version" : "versions") + " bound.");
             }
         } else {
             hash = currentActivityHash(user);
@@ -559,10 +759,24 @@ final class Ghost {
             store.save();
         }
 
+        // Sockets only settle once the items are actually equipped, so this comes last.
+        PlugResult plugs = restorePlugs(user, items, accessToken);
+
         EmbedBuilder embed = new EmbedBuilder()
                 .setTitle(equipped == items.size() ? name + " equipped" : name + " partly equipped")
                 .setColor(ACCENT)
-                .setDescription(equipped + " of " + items.size() + " items on.");
+                .setDescription(equipped + " of " + items.size() + " items on."
+                        + (plugs.applied() > 0
+                           ? "\nRestored " + plugs.applied() + " perks, mods and subclass choices."
+                           : ""));
+
+        if (plugs.capped()) {
+            embed.addField("Stopped early", "Hit the " + MAX_PLUG_WRITES
+                    + " socket-write limit. Run it again to finish the rest.", false);
+        }
+        if (!plugs.failed().isEmpty()) {
+            embed.addField("Couldn't set", join(plugs.failed()), false);
+        }
 
         if (!moved.isEmpty()) {
             embed.addField("Pulled from storage", join(moved), false);
@@ -725,6 +939,98 @@ final class Ghost {
         return locations;
     }
 
+    /**
+     * The plugs sitting in an item's visible sockets, keyed by socket index.
+     *
+     * <p>Hidden sockets are skipped deliberately. On armour they hold the stat rolls and
+     * other internals that are not player-changeable, so capturing them would only produce
+     * writes that are guaranteed to fail.
+     */
+    private Map<Integer, Long> readPlugs(JsonObject socketData, String instanceId) {
+        if (socketData == null || !socketData.has(instanceId)) {
+            return null;
+        }
+        JsonArray sockets = socketData.getAsJsonObject(instanceId).getAsJsonArray("sockets");
+        if (sockets == null) {
+            return null;
+        }
+
+        Map<Integer, Long> plugs = new LinkedHashMap<>();
+        for (int index = 0; index < sockets.size(); index++) {
+            JsonObject socket = sockets.get(index).getAsJsonObject();
+            boolean visible = socket.has("isVisible") && socket.get("isVisible").getAsBoolean();
+            if (visible && socket.has("plugHash")) {
+                plugs.put(index, socket.get("plugHash").getAsLong());
+            }
+        }
+        return plugs.isEmpty() ? null : plugs;
+    }
+
+    /** What a socket restore managed to do, for reporting back. */
+    private record PlugResult(int applied, List<String> failed, boolean capped) {
+    }
+
+    /**
+     * Puts saved perks, mods, shaders and subclass choices back.
+     *
+     * <p>Only sockets whose current plug differs from the saved one are written. That keeps
+     * the call count proportional to what actually changed rather than to the size of the
+     * set — and it means fixed sockets are skipped for free, since a socket you cannot
+     * change will already match.
+     */
+    private PlugResult restorePlugs(Store.User user, List<Store.Item> items, String accessToken) {
+        List<String> failed = new ArrayList<>();
+        int applied = 0;
+        boolean capped = false;
+
+        JsonObject socketData;
+        try {
+            socketData = child(client.profile(user.membershipType, user.membershipId,
+                    EQUIPMENT_COMPONENTS), "itemComponents", "sockets", "data");
+        } catch (IOException e) {
+            return new PlugResult(0, List.of("couldn't read current sockets"), false);
+        }
+        if (socketData == null) {
+            return new PlugResult(0, List.of(), false);
+        }
+
+        outer:
+        for (Store.Item item : items) {
+            if (item.plugs == null || item.plugs.isEmpty()) {
+                continue;
+            }
+            Map<Integer, Long> current = readPlugs(socketData, item.instanceId);
+            if (current == null) {
+                continue;
+            }
+
+            for (Map.Entry<Integer, Long> wanted : item.plugs.entrySet()) {
+                Long now = current.get(wanted.getKey());
+                if (now != null && now.equals(wanted.getValue())) {
+                    continue;
+                }
+                if (applied + failed.size() >= MAX_PLUG_WRITES) {
+                    capped = true;
+                    break outer;
+                }
+                try {
+                    client.insertPlugFree(user.membershipType, user.characterId, item.instanceId,
+                            wanted.getKey(), wanted.getValue(), accessToken);
+                    applied++;
+                    // Pace the writes; a full subclass rebuild is a burst of small calls.
+                    Thread.sleep(120);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break outer;
+                } catch (IOException e) {
+                    int code = e instanceof BungieClient.BungieException be ? be.code : 0;
+                    failed.add(manifest.itemName(wanted.getValue()) + " — " + reason(code));
+                }
+            }
+        }
+        return new PlugResult(applied, failed, capped);
+    }
+
     /** The vault's own bucket. Account-scope, 1300 slots. */
     private static final long VAULT_BUCKET = 138197802L;
 
@@ -751,15 +1057,9 @@ final class Ghost {
 
     /** A bucket's slot count, from the manifest. Cached, so this is one lookup per bucket. */
     private int capacity(long bucketHash) {
-        try {
-            JsonObject definition = manifest.definition("DestinyInventoryBucketDefinition", bucketHash);
-            if (definition != null && definition.has("itemCount")) {
-                return definition.get("itemCount").getAsInt();
-            }
-        } catch (Exception e) {
-            // Fall through — assuming ten is far better than refusing to equip.
-        }
-        return ASSUMED_CAPACITY;
+        int known = manifest.bucketCapacity(bucketHash);
+        // Assuming ten is far better than refusing to equip because a table has not loaded.
+        return known > 0 ? known : ASSUMED_CAPACITY;
     }
 
     /**
@@ -826,16 +1126,8 @@ final class Ghost {
         if (item.bucketHash != 0) {
             return item.bucketHash;
         }
-        try {
-            JsonObject definition = manifest.definition(ITEM_DEFINITION, item.itemHash);
-            JsonObject inventory = definition == null ? null : child(definition, "inventory");
-            if (inventory != null && inventory.has("bucketTypeHash")) {
-                return inventory.get("bucketTypeHash").getAsLong();
-            }
-        } catch (Exception e) {
-            // Unknown bucket just means the capacity check is skipped for this item.
-        }
-        return 0;
+        Manifest.Item definition = manifest.item(item.itemHash);
+        return definition == null ? 0 : definition.bucketHash();
     }
 
     private Store.Item byInstance(List<Store.Item> items, String instanceId) {
@@ -848,15 +1140,12 @@ final class Ghost {
     }
 
     private String itemName(Store.Item item) {
-        if (item == null) {
-            return "an item";
-        }
-        try {
-            String name = manifest.displayName(ITEM_DEFINITION, item.itemHash);
-            return name == null || name.isBlank() ? "Item " + item.itemHash : name;
-        } catch (Exception e) {
-            return "Item " + item.itemHash;
-        }
+        return item == null ? "an item" : manifest.itemName(item.itemHash);
+    }
+
+    /** The item's name with its type, e.g. {@code Gjallarhorn — Exotic Rocket Launcher}. */
+    private String describeItem(Store.Item item) {
+        return item == null ? "an item" : manifest.describeItem(item.itemHash);
     }
 
     /** Turns a platform error code into something worth reading in Discord. */

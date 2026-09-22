@@ -34,8 +34,10 @@ public class DiscordBot extends ListenerAdapter {
 
     private final BungieClient bungie = new BungieClient();
     private final ManifestCache manifest = new ManifestCache(bungie);
+    /** Name lookups for the tens of thousands of hashes the API deals in. */
+    private final Manifest names = new Manifest(bungie, manifest);
     private final Store store = new Store();
-    private final Ghost ghost = new Ghost(bungie, manifest, store);
+    private final Ghost ghost = new Ghost(bungie, names, store);
     private BackgroundThread watcher;
 
     /**
@@ -85,7 +87,7 @@ public class DiscordBot extends ListenerAdapter {
                         .setDefaultPermissions(DefaultMemberPermissions.enabledFor(Permission.MESSAGE_MANAGE)),
 
                 Commands.slash("item", "Look up a Destiny item by its manifest hash")
-                        .addOption(STRING, "hash", "Item hash — find it in a light.gg or Armory URL", true),
+                        .addOption(STRING, "name", "Item name, or a hash from a light.gg or Armory URL", true),
 
                 Commands.slash("weekly", "Show the milestones currently active this week"),
 
@@ -125,7 +127,7 @@ public class DiscordBot extends ListenerAdapter {
                 Commands.slash("map", "Bind a set to an activity — run it while you're in there")
                         .addOptions(loadoutName().setName("loadout")
                                 .setDescription("The set to bind").setRequired(true))
-                        .addOption(STRING, "activity", "Activity hash, if you're not in it now"),
+                        .addOption(STRING, "activity", "Activity name or hash, if you're not in it now"),
 
                 Commands.slash("unmap", "Remove the binding for an activity")
                         .addOption(STRING, "activity", "Activity hash, if you're not in it now"),
@@ -133,10 +135,15 @@ public class DiscordBot extends ListenerAdapter {
                 Commands.slash("autoequip", "Whether I act on my own between activities")
                         .addOption(BOOLEAN, "on", "Turn it on or off", true),
 
+                Commands.slash("artifact", "Your seasonal artifact and which perks are active"),
+
                 Commands.slash("snapshot", "Save your current gear into an in-game loadout slot")
                         .addOptions(new OptionData(INTEGER, "slot", "Which of the 20 slots", true)
                                 .setRequiredRange(1, 20))
         ).queue();
+
+        // Downloads in the background; commands work meanwhile via per-hash lookups.
+        bot.names.loadInBackground();
 
         new GhostWatcher(jda, bot.ghost, bot.store).start();
     }
@@ -170,7 +177,19 @@ public class DiscordBot extends ListenerAdapter {
                 prune(event);
                 break;
             case "item":
-                destiny(event, false, () -> Destiny.item(bungie, manifest, event.getOption("hash").getAsString()));
+                destiny(event, false, () -> {
+                    String query = event.getOption("name").getAsString().trim();
+                    // A name is what people have; the hash is what the API wants.
+                    if (!query.chars().allMatch(Character::isDigit)) {
+                        long resolved = names.resolveItem(query);
+                        if (resolved == -1) {
+                            return Destiny.error("Nothing called `" + query + "`."
+                                    + (names.isReady() ? "" : " The manifest is still loading — try again shortly."));
+                        }
+                        query = String.valueOf(resolved);
+                    }
+                    return Destiny.item(bungie, manifest, query);
+                });
                 break;
             case "weekly":
                 destiny(event, false, () -> Destiny.weekly(bungie, manifest));
@@ -225,6 +244,9 @@ public class DiscordBot extends ListenerAdapter {
                 break;
             case "snapshot":
                 destiny(event, false, () -> ghost.snapshot(discordId, event.getOption("slot").getAsInt()));
+                break;
+            case "artifact":
+                destiny(event, false, () -> ghost.artifact(discordId));
                 break;
             case "shaders":
                 event.reply("I'll shade you").setEphemeral(true).queue();
@@ -299,29 +321,57 @@ public class DiscordBot extends ListenerAdapter {
         if (!content.startsWith("!") || content.length() < 2)
             return;
 
-        String name = content.substring(1).split("\\s+")[0].toLowerCase(Locale.ROOT);
+        String[] parts = content.substring(1).split("\\s+", 2);
+        String verb = parts[0].toLowerCase(Locale.ROOT);
+        String argument = parts.length > 1 ? parts[1].trim() : "";
         String discordId = event.getAuthor().getId();
         MessageChannel channel = event.getChannel();
 
         Thread.ofVirtual().start(() -> {
             try
             {
-                MessageEmbed embed = name.equals("activityloadout")
-                        ? ghost.activityLoadout(discordId)
-                        : ghost.equipLoadout(discordId, name, true);
+                MessageEmbed embed = switch (verb)
+                {
+                    // Print a set, or everything saved when no name is given.
+                    case "loadout", "loadouts" -> argument.isEmpty()
+                            ? ghost.listLoadouts(discordId)
+                            : ghost.showLoadout(discordId, argument);
+                    // Save what you are wearing under a name.
+                    case "set", "save" -> ghost.saveLoadout(discordId, argument);
+                    // Equip by name, or work it out from the activity when unnamed.
+                    case "equip" -> argument.isEmpty()
+                            ? ghost.activityLoadout(discordId)
+                            : ghost.equipLoadout(discordId, argument, true);
+                    case "activityloadout" -> ghost.activityLoadout(discordId);
+                    case "map" -> ghost.mapActivity(discordId, argument, null);
+                    case "activity" -> ghost.activity(discordId);
+                    case "artifact" -> ghost.artifact(discordId);
+                    // Anything else is treated as a loadout name: !kingsfall
+                    default -> ghost.equipLoadout(discordId, verb, true);
+                };
                 channel.sendMessageEmbeds(embed).queue();
             }
             catch (Exception e)
             {
-                // Unknown names are common — someone else's bot prefix, a typo — so only
-                // answer when the problem is worth reporting.
-                Store.User owner = store.peek(discordId);
-                if ((owner == null || !owner.loadouts.containsKey(name))
-                        && !name.equals("activityloadout"))
+                // A bare "!something" that matches no saved set is far more likely to be
+                // another bot's prefix or a typo than a request to this one, so stay quiet
+                // unless the message was clearly aimed here.
+                if (!KNOWN_VERBS.contains(verb) && !hasLoadout(discordId, verb))
                     return;
                 channel.sendMessageEmbeds(Destiny.error(e.getMessage())).queue();
             }
         });
+    }
+
+    /** Prefix words the bot owns, so a failure is worth reporting rather than ignoring. */
+    private static final java.util.Set<String> KNOWN_VERBS = java.util.Set.of(
+            "loadout", "loadouts", "set", "save", "equip", "activityloadout", "map",
+            "activity", "artifact");
+
+    private boolean hasLoadout(String discordId, String name)
+    {
+        Store.User user = store.peek(discordId);
+        return user != null && user.loadouts.containsKey(name.toLowerCase(Locale.ROOT));
     }
 
     /** Replies and returns true when a guild-only command was used outside a guild. */

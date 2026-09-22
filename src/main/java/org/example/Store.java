@@ -61,11 +61,21 @@ final class Store {
         }
     }
 
-    /** One equippable item, identified by instance. */
+    /** One equippable item, identified by instance, with whatever is plugged into it. */
     static final class Item {
         String instanceId;
         long itemHash;
         long bucketHash;
+
+        /**
+         * Socket index to the plug hash sitting in it.
+         *
+         * <p>Only visible sockets are kept: the hidden ones carry armour stats and other
+         * internals that are not player-changeable, and writing to them is neither possible
+         * nor wanted. Null on sets saved before sockets were captured, which is why every
+         * read of this is null-checked rather than assumed.
+         */
+        Map<Integer, Long> plugs;
 
         Item(String instanceId, long itemHash, long bucketHash) {
             this.instanceId = instanceId;

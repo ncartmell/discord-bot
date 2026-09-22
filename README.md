@@ -11,7 +11,7 @@ act as a ghost: link an account, see what you're playing, and put gear on.
 
 | Command | What it does |
 | --- | --- |
-| `/item <hash>` | Look up a Destiny item by its manifest hash |
+| `/item <name>` | Look up a Destiny item by name (or hash) |
 | `/weekly` | The milestones currently active this week |
 | `/news` | The latest articles from Bungie.net |
 | `/profile <name>` | Lifetime PvE stats for a Bungie name, e.g. `Guardian#1234` |
@@ -24,11 +24,17 @@ act as a ghost: link an account, see what you're playing, and put gear on.
 | `/link` | Start the Bungie authorisation, then `/link code:<code>` to finish |
 | `/unlink` | Remove the stored tokens. Saved loadouts are kept |
 | `/activity` | What you're in right now, and whether a set is mapped to it |
-| `/loadout save <name>` | Store what you're wearing, by item instance id |
-| `/loadout list` / `show` / `delete` | Manage saved sets |
+| `/loadout save <name>` | Store what you're wearing: items, perks, mods, subclass config |
+| `/loadout show <name>` | Print the set in full — every item, type and plug |
+| `/loadout list` / `delete` | Manage saved sets |
+| `/artifact` | Your seasonal artifact and which perks are active (read-only) |
 | `/equip <name>` | Put a set on — or queue it until you're next in orbit |
 | `!kingsfall` | The same thing, if prefix commands are enabled |
-| `/map <loadout>` | Bind a set to the activity you're currently in |
+| `!loadout` / `!loadout <name>` | List sets, or print one |
+| `!set <name>` | Save what you're wearing |
+| `!equip [name]` | Equip by name, or from the activity when unnamed |
+| `!map <name>`, `!activity`, `!artifact` | The prefix forms of the above |
+| `/map <loadout> [activity]` | Bind a set to the activity you're in, or one named outright |
 | `/unmap` | Remove that binding |
 | `/activityloadout` | Equip whatever is mapped to the activity you're in |
 | `/autoequip on\|off` | Whether the bot acts between activities |
@@ -37,6 +43,28 @@ act as a ghost: link an account, see what you're playing, and put gear on.
 ### Moderation
 
 `/ban`, `/say`, `/leave`, `/prune`.
+
+## What a set covers
+
+A saved set is a list of **item instance ids** plus the state of every visible socket on
+each one, so it restores more than which guns you had:
+
+- **Weapons and armour**, by specific instance — the exact roll, not whichever copy the
+  game picks.
+- **The subclass**, which is an ordinary instanced item and so was always covered.
+- **Subclass configuration** — super, class ability, movement, melee, grenade, aspects and
+  fragments. These are sockets on the subclass item.
+- **Armour mods, weapon perks, shaders and ornaments** — also sockets.
+- **Ghost, sparrow, ship and emblem**, as plain equips.
+
+Restoring only writes sockets whose current plug differs from the saved one, so the number
+of calls is proportional to what actually changed rather than to the size of the set. It
+also means unchangeable sockets are skipped for free: one you cannot alter already matches.
+
+**The artifact is read-only.** `/artifact` shows the seasonal artifact, your power bonus and
+which perks are active, but it cannot set them. There is no action endpoint for the artifact
+anywhere in the API, and its perks are progression state rather than sockets on an instanced
+item, so the plug endpoints have nothing to address. That has to be done in game.
 
 ## The two constraints that shape all of this
 
@@ -74,6 +102,19 @@ copy of an item — not just whichever roll the game would pick.
 
 ## Other notes on the Bungie API
 
+**Sockets are writable, within limits.** `InsertSocketPlugFree` needs only
+`MoveEquipDestinyItems` — the scope the bot already has — and is documented as available to
+third-party apps for "free and reversible" socket actions: perks, armour mods, shaders,
+ornaments. Subclass abilities, aspects and fragments are sockets too, so they come along
+with it. The other variant, `InsertSocketPlug`, covers plugs with side effects and needs
+`AdvancedWriteActions`, which Bungie grants case by case — out of reach here.
+
+It takes one plug per call and carries the same location restriction as equipping.
+
+**Skip sockets marked `isVisible: false`.** On armour those hold stat rolls and other
+internals that are not player-changeable, so capturing them would only produce writes
+guaranteed to fail.
+
 **Reading needs no OAuth.** Characters, equipment, character inventories, the vault and
 the current activity are all readable with the API key alone. Only `/Destiny2/Actions/`
 acts on someone's behalf. Authenticated calls want `X-API-Key` *and* `Authorization:
@@ -107,16 +148,29 @@ otherwise making room would just fail one step later.
 Bungie.net membership; `GetLinkedProfiles` turns it into the platform membership the
 Destiny endpoints want.
 
-**Item lookup takes a hash rather than a name.** Bungie documents a search endpoint at
-`/Destiny2/Armory/Search/{type}/{term}/`, but it returns `NotFound` for every query and
-appears to have been retired without the docs catching up. The alternative is the item
-definition component of the manifest, which is roughly 200 MB — too much for a bot this
-size to hold. Item hashes are visible in the URL of any item page on light.gg or Bungie's
-own Armory.
+**There is no working item search, so the bot builds its own index.** Bungie documents a
+search endpoint at `/Destiny2/Armory/Search/{type}/{term}/`, but it returns `NotFound` for
+every query and appears to have been retired without the docs catching up.
 
-**Definitions are cached in memory.** Most of the API identifies things by hash, so
-rendering a milestone list means a lookup per hash. `ManifestCache` keeps them for the
-life of the process, since definitions only change when the game patches.
+The manifest fills the gap. Its tables are published as per-language JSON files listed under
+`jsonWorldComponentContentPaths`, so you can take just the one you need rather than the whole
+thing. `DestinyInventoryItemDefinition` is about 190 MB uncompressed across ~39,000 entries —
+far too much to hold as a parsed tree, which is why an earlier version of this README said it
+was out of reach. It is not: the names alone are under a megabyte. `Manifest` streams the
+download and keeps only the fields that get displayed, discarding each entry's remaining
+hundred-odd properties as it goes.
+
+Measured on a cold start: **1.4 seconds, about 10 MB retained**, for 36,687 items and 3,744
+activities. It loads on a background thread, so commands work immediately and fall back to
+single-hash HTTP lookups until it arrives.
+
+That is what makes names usable throughout — `/item Gjallarhorn`, `/map kingsfall` — and it
+is what makes the socket features practical at all. A set with twelve items and sixty plugs
+would otherwise mean seventy-odd HTTP round trips to print one message.
+
+**Binding by name binds every variant.** A raid exists as several activity hashes — King's
+Fall resolves to five, across Standard, Normal, Master and Expert — and binding a set to the
+name covers all of them, which is almost always what is meant.
 
 **Lookups can return success with no body.** A hash that no longer exists comes back as
 `ErrorCode 1, "Ok"` with no `Response` at all rather than an error, so the client treats a

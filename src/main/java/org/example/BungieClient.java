@@ -209,6 +209,38 @@ public class BungieClient {
     }
 
     /**
+     * Inserts a plug into one of an item's sockets: a perk, armour mod, shader, ornament,
+     * or any of a subclass's abilities, aspects and fragments.
+     *
+     * <p>Uses the "free" variant, which Bungie documents as available to third-party
+     * applications for "free and reversible" socket actions and which needs only the scope
+     * this bot already holds. The other variant, {@code InsertSocketPlug}, covers plugs with
+     * side effects and requires {@code AdvancedWriteActions} — a scope Bungie grants case by
+     * case, so it is out of reach here.
+     *
+     * <p>Carries the same location restriction as equipping: social space, orbit or offline.
+     *
+     * @param socketIndex index into the item's default socket array
+     * @param plugItemHash the plug to put in it
+     */
+    void insertPlugFree(int membershipType, String characterId, String itemInstanceId,
+                        int socketIndex, long plugItemHash, String accessToken) throws IOException {
+        JsonObject plug = new JsonObject();
+        plug.addProperty("socketIndex", socketIndex);
+        // 0 selects the default socket array rather than the separate intrinsic one.
+        plug.addProperty("socketArrayType", 0);
+        plug.addProperty("plugItemHash", plugItemHash);
+
+        JsonObject body = new JsonObject();
+        body.add("plug", plug);
+        body.addProperty("itemId", Long.parseLong(itemInstanceId));
+        body.addProperty("characterId", Long.parseLong(characterId));
+        body.addProperty("membershipType", membershipType);
+
+        postAs("/Destiny2/Actions/Items/InsertSocketPlugFree/", body.toString(), accessToken);
+    }
+
+    /**
      * Saves whatever the character is currently wearing into one of the 20 in-game loadout slots.
      *
      * <p>Unlike the equip endpoints this carries no documented restriction on where the
