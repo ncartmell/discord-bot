@@ -12,7 +12,8 @@ act as a ghost: link an account, see what you're playing, and put gear on.
 | Command | What it does |
 | --- | --- |
 | `/item <name>` | Look up a Destiny item by name (or hash) |
-| `/weekly` | The milestones currently active this week |
+| `/weekly` | What's featured this week, with activities and time to reset |
+| `/clan` | Your clan, and this week's engram progress |
 | `/news` | The latest articles from Bungie.net |
 | `/profile <name>` | Lifetime PvE stats for a Bungie name, e.g. `Guardian#1234` |
 | `/watch` | Announce the weekly rotation in this channel when it changes |
@@ -36,7 +37,8 @@ act as a ghost: link an account, see what you're playing, and put gear on.
 | `/artifact` | Your seasonal artifact and which perks are active (read-only) |
 | `/equip <name>` | Put a set on — or queue it until you're next in orbit |
 | `/postmaster` | What's waiting in your postmaster, with a menu to pull items back |
-| `/bounties` | Bounties and quest steps, with progress on each |
+| `/bounties` | Your bounties, with progress on each |
+| `/quests` | Your quest steps, kept separate from bounties |
 | `/fireteam` | Who you're playing with right now |
 | `/currencies` | Glimmer and the rest |
 | `/vendor <name>` | What a vendor is selling you |
@@ -65,7 +67,8 @@ wrong in either direction is worse than typing a verb.
 | `!activity` / `!artifact` / `!postmaster` | As their slash equivalents |
 | `!xur`, `!vendor <name>` | Vendor stock |
 | `!recent`, `!pgcr`, `!clears`, `!weapon`, `!topweapons` | Stats |
-| `!bounties`, `!fireteam`, `!currencies`, `!destination <name>` | Account and world |
+| `!bounties`, `!quests`, `!fireteam`, `!currencies` | Account |
+| `!destination <name>`, `!weekly`, `!clan` | World |
 | `!lock <set>` / `!unlock <set>` | Lock or unlock a saved set |
 
 ### Moderation
@@ -255,6 +258,21 @@ when neither exists.
 `fastestCompletionMsForActivity` counts any completion, so a four-minute King's Fall is a
 final-encounter run rather than a full clear. The footer says so rather than implying a
 record.
+
+**There is no rotator endpoint either.** The public milestone feed is the closest thing:
+each entry carries the activities it covers and an end date, so resolving the hashes gives
+the week's featured raids and dungeons together with the reset they expire at. Milestones
+with an activity attached are the featured content; the rest are chores.
+
+**Clans are groups, so they are under `/GroupV2/`**, not `/Destiny2/` — which is why nothing
+in the Destiny endpoint listing hints at them. Membership, group detail and the weekly
+reward state are all readable without a token.
+
+**Bounties and quest steps share one bucket.** Both sit in Quests (1345459588), and the only
+thing separating them is `DestinyItemType`: 26 is a bounty, 12 and 13 are quest steps. They
+are split across two commands because they behave differently — bounties expire at reset and
+are meant to be churned through, while a quest step sits there until finished. Mixed into one
+list the bounties bury the quests, which are the ones people actually forget about.
 
 **There is no "what's on the Moon" endpoint.** What there is is `characterActivities`,
 which lists roughly 280 activities currently available to a character, each with its

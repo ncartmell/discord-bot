@@ -260,6 +260,23 @@ public class BungieClient {
         return json.getAsJsonObject("Response");
     }
 
+    /**
+     * The clans a player belongs to.
+     *
+     * <p>Clans are groups, so this is under {@code /GroupV2/}, not {@code /Destiny2/}. The
+     * trailing path values are the filter (0, meaning all) and the group type (1, clan).
+     */
+    JsonArray clansFor(int membershipType, String membershipId) throws IOException {
+        JsonObject response = response("/GroupV2/User/" + membershipType + "/" + membershipId + "/0/1/");
+        JsonArray results = response.getAsJsonArray("results");
+        return results == null ? new JsonArray() : results;
+    }
+
+    /** Which of the clan's weekly engram rewards have been earned. */
+    JsonObject clanWeeklyRewardState(String groupId) throws IOException {
+        return response("/Destiny2/Clan/" + groupId + "/WeeklyRewardState/");
+    }
+
     /** Locks or unlocks an item, which is what stops it being dismantled by accident. */
     void setLockState(int membershipType, String characterId, String instanceId, boolean locked,
                       String accessToken) throws IOException {

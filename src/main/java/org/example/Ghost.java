@@ -514,6 +514,21 @@ final class Ghost {
      * that is not the caller's own.
      */
     MessageEmbed bounties(String discordId) throws IOException {
+        return pursuits(discordId, true);
+    }
+
+    /**
+     * Quest steps, which share the Quests bucket with bounties but behave differently.
+     *
+     * <p>Worth separating: bounties expire at reset and are meant to be churned through,
+     * while a quest step sits there until you finish it. Mixed into one list the bounties
+     * bury the quests, which are the ones you actually forget about.
+     */
+    MessageEmbed quests(String discordId) throws IOException {
+        return pursuits(discordId, false);
+    }
+
+    private MessageEmbed pursuits(String discordId, boolean wantBounties) throws IOException {
         Store.User user = requireLinked(discordId);
         JsonObject profile = client.profile(user.membershipType, user.membershipId, "201,301",
                 token(user));
@@ -532,7 +547,17 @@ final class Ghost {
             if (!item.has("bucketHash") || item.get("bucketHash").getAsLong() != QUESTS_BUCKET) {
                 continue;
             }
-            String name = manifest.itemName(item.get("itemHash").getAsLong());
+            long itemHash = item.get("itemHash").getAsLong();
+            Manifest.Item pursuit = manifest.item(itemHash);
+            // DestinyItemType separates the two: 26 is a bounty, 12 and 13 are quest steps.
+            // Anything unrecognised is treated as a quest, since that list is the shorter one
+            // and an unexplained omission is worse than an unexpected entry.
+            boolean isBounty = pursuit != null && pursuit.isBounty();
+            if (isBounty != wantBounties) {
+                continue;
+            }
+
+            String name = manifest.itemName(itemHash);
             String instanceId = item.has("itemInstanceId") ? item.get("itemInstanceId").getAsString() : null;
 
             List<String> steps = new ArrayList<>();
@@ -569,15 +594,19 @@ final class Ghost {
             (complete ? done : active).add(entry);
         }
 
+        String label = wantBounties ? "Bounties" : "Quests";
         if (active.isEmpty() && done.isEmpty()) {
-            return simple("Bounties", "Nothing tracked. Your Quests tab is empty.");
+            return simple(label, wantBounties
+                    ? "No bounties. Pick some up from a vendor."
+                    : "No quest steps in progress.");
         }
 
         EmbedBuilder embed = new EmbedBuilder()
-                .setTitle("Bounties and quests")
+                .setTitle(label)
                 .setColor(ACCENT)
-                .setDescription((active.size() + done.size()) + " of "
-                        + Math.max(1, manifest.bucketCapacity(QUESTS_BUCKET)) + " slots used");
+                .setDescription((active.size() + done.size()) + " tracked, of "
+                        + Math.max(1, manifest.bucketCapacity(QUESTS_BUCKET))
+                        + " slots shared with " + (wantBounties ? "quests" : "bounties"));
         if (!done.isEmpty()) {
             embed.addField("Ready to hand in (" + done.size() + ")", join(done), false);
         }

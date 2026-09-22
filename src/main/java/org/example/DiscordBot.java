@@ -44,6 +44,8 @@ public class DiscordBot extends ListenerAdapter {
     private final Stats stats = new Stats(bungie, names, store);
     private final Vendors vendors = new Vendors(bungie, names, store, ghost);
     private final World world = new World(bungie, names, store, ghost);
+    private final Weekly weekly = new Weekly(bungie, names);
+    private final Clan clan = new Clan(bungie, store);
     private BackgroundThread watcher;
 
     /**
@@ -95,7 +97,11 @@ public class DiscordBot extends ListenerAdapter {
                 Commands.slash("item", "Look up a Destiny item by its manifest hash")
                         .addOption(STRING, "name", "Item name, or a hash from a light.gg or Armory URL", true),
 
-                Commands.slash("weekly", "Show the milestones currently active this week"),
+                Commands.slash("weekly", "What's featured this week, and when it resets"),
+
+                Commands.slash("clan", "Your clan, and this week's engram progress"),
+
+                Commands.slash("quests", "Your quest steps, with progress on each"),
 
                 Commands.slash("news", "The latest articles from Bungie.net"),
 
@@ -236,7 +242,13 @@ public class DiscordBot extends ListenerAdapter {
                 });
                 break;
             case "weekly":
-                destiny(event, false, () -> Destiny.weekly(bungie, manifest));
+                destiny(event, false, weekly::rotators);
+                break;
+            case "clan":
+                destiny(event, false, () -> clan.clan(discordId));
+                break;
+            case "quests":
+                destiny(event, false, () -> ghost.quests(discordId));
                 break;
             case "news":
                 destiny(event, false, () -> Destiny.news(bungie));
@@ -455,6 +467,9 @@ public class DiscordBot extends ListenerAdapter {
                     case "topweapons" -> stats.topWeapons(discordId, number(argument, 10, 20));
                     case "destination", "destinations" -> world.destination(discordId, argument);
                     case "bounties" -> ghost.bounties(discordId);
+                    case "quests" -> ghost.quests(discordId);
+                    case "clan" -> clan.clan(discordId);
+                    case "weekly", "rotators" -> weekly.rotators();
                     case "fireteam" -> ghost.fireteam(discordId);
                     case "currencies" -> ghost.currencies(discordId);
                     case "lock" -> ghost.lockSet(discordId, argument, true);
@@ -495,7 +510,8 @@ public class DiscordBot extends ListenerAdapter {
             "loadout", "loadouts", "set", "save", "equip", "activityloadout", "map",
             "activity", "artifact", "postmaster", "xur", "vendor", "recent", "pgcr",
             "clears", "weapon", "topweapons", "bounties", "fireteam", "currencies",
-            "lock", "unlock", "destination", "destinations");
+            "lock", "unlock", "destination", "destinations", "quests", "clan",
+            "weekly", "rotators");
 
     /** Parses a count from a prefix argument, falling back when it is missing or nonsense. */
     private static int number(String argument, int fallback, int limit)

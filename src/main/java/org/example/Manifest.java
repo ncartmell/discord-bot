@@ -36,7 +36,19 @@ import java.util.zip.GZIPInputStream;
 final class Manifest {
 
     /** What gets kept for each item: enough to say "Gjallarhorn — Exotic Rocket Launcher". */
-    record Item(String name, String type, String tier, long bucketHash, boolean pullHasSideEffects) {
+    record Item(String name, String type, String tier, long bucketHash, boolean pullHasSideEffects,
+                int itemType) {
+
+        /** DestinyItemType 26. Bounties expire; quest steps do not. */
+        boolean isBounty() {
+            return itemType == 26;
+        }
+
+        /** DestinyItemType 12 and 13: a step of a quest, in progress or finished. */
+        boolean isQuestStep() {
+            return itemType == 12 || itemType == 13;
+        }
+
 
         /** The name with its type, e.g. {@code Gjallarhorn — Exotic Rocket Launcher}. */
         String describe() {
@@ -320,6 +332,16 @@ final class Manifest {
     record Objective(String description, int completionValue) {
     }
 
+    /**
+     * A milestone's name.
+     *
+     * <p>Not preloaded: there are only a dozen live at a time, so a cached per-hash lookup
+     * costs one request each and then nothing.
+     */
+    String milestoneName(long hash) {
+        return viaFallback("DestinyMilestoneDefinition", hash);
+    }
+
     String vendorName(long hash) {
         String name = vendors.get(hash);
         if (name != null) {
@@ -481,6 +503,7 @@ final class Manifest {
                 String tier = null;
                 long bucket = 0;
                 boolean sideEffects = false;
+                int itemType = 0;
 
                 reader.beginObject();
                 while (reader.hasNext()) {
@@ -500,6 +523,7 @@ final class Manifest {
                         // Bungie's own warning that pulling this from the postmaster could
                         // destroy something. Worth carrying so the bot can say so first.
                         case "doesPostmasterPullHaveSideEffects" -> sideEffects = reader.nextBoolean();
+                        case "itemType" -> itemType = reader.nextInt();
                         case "inventory" -> {
                             reader.beginObject();
                             while (reader.hasNext()) {
@@ -518,7 +542,7 @@ final class Manifest {
                 reader.endObject();
 
                 if (name != null && !name.isBlank()) {
-                    out.put(hash, new Item(name, type, tier, bucket, sideEffects));
+                    out.put(hash, new Item(name, type, tier, bucket, sideEffects, itemType));
                 }
             }
             reader.endObject();
