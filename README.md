@@ -91,6 +91,18 @@ locates every item first and transfers anything that is in the vault or on anoth
 character before equipping. Moving between characters goes via the vault; there is no
 direct transfer.
 
+**A transfer in needs a free slot.** Each character gear bucket is ten slots
+(`DestinyInventoryBucketDefinition.itemCount`), and that ten *includes* the equipped item
+— so a full kinetic slot is nine in the inventory plus the one in your hands. Transferring
+into a full bucket is refused with `1642 DestinyNoRoomInDestination`, so the bot counts
+occupancy from `characterInventories` plus `characterEquipment` first and pushes something
+to the vault when a bucket is already at capacity. It only evicts from the inventory, never
+what is equipped, and never anything belonging to the set being applied. Whatever it moves
+is named in the reply.
+
+The vault is a bucket too (`138197802`, 1300 slots), so that is checked before evicting —
+otherwise making room would just fail one step later.
+
 **The OAuth membership id is not the Destiny one.** The token response carries a
 Bungie.net membership; `GetLinkedProfiles` turns it into the platform membership the
 Destiny endpoints want.

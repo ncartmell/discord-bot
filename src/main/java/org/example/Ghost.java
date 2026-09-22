@@ -464,6 +464,16 @@ final class Ghost {
 
         List<String> missing = new ArrayList<>();
         List<String> moved = new ArrayList<>();
+        List<String> displaced = new ArrayList<>();
+
+        // Character gear buckets hold ten slots each, counting the equipped item, so a
+        // transfer into a full one is refused outright. Track occupancy as we go and push
+        // something out first when a bucket is already at capacity.
+        Map<Long, Integer> used = occupancy(profile, user.characterId);
+        java.util.Set<String> keep = new java.util.HashSet<>();
+        for (Store.Item item : items) {
+            keep.add(item.instanceId);
+        }
 
         for (Store.Item item : items) {
             String where = locations.get(item.instanceId);
@@ -475,7 +485,19 @@ final class Ghost {
             if (where.equals(user.characterId)) {
                 continue;
             }
+
+            long bucket = destinationBucket(item);
             try {
+                if (bucket != 0 && used.getOrDefault(bucket, 0) >= capacity(bucket)) {
+                    String evicted = makeRoom(user, profile, bucket, keep, accessToken);
+                    if (evicted == null) {
+                        missing.add(itemName(item) + " (no room, nothing safe to move out)");
+                        continue;
+                    }
+                    displaced.add(evicted);
+                    used.merge(bucket, -1, Integer::sum);
+                }
+
                 if (!"vault".equals(where)) {
                     // Another character holds it, and everything routes through the vault.
                     client.transferItem(user.membershipType, where, item.instanceId, item.itemHash,
@@ -484,6 +506,9 @@ final class Ghost {
                 client.transferItem(user.membershipType, user.characterId, item.instanceId,
                         item.itemHash, false, accessToken);
                 moved.add(itemName(item));
+                if (bucket != 0) {
+                    used.merge(bucket, 1, Integer::sum);
+                }
             } catch (BungieClient.BungieException e) {
                 if (e.code == AT_THIS_LOCATION) {
                     return blocked(user, name, queueIfBlocked, "Items need moving and the game"
@@ -541,6 +566,9 @@ final class Ghost {
 
         if (!moved.isEmpty()) {
             embed.addField("Pulled from storage", join(moved), false);
+        }
+        if (!displaced.isEmpty()) {
+            embed.addField("Moved to the vault to make room", join(displaced), false);
         }
         if (!missing.isEmpty()) {
             embed.addField("Couldn't find", join(missing), false);
@@ -695,6 +723,119 @@ final class Ghost {
             }
         }
         return locations;
+    }
+
+    /** The vault's own bucket. Account-scope, 1300 slots. */
+    private static final long VAULT_BUCKET = 138197802L;
+
+    /** Character gear buckets are ten slots; used only if the manifest lookup fails. */
+    private static final int ASSUMED_CAPACITY = 10;
+
+    /** How many slots each of the character's buckets is currently using, equipped included. */
+    private Map<Long, Integer> occupancy(JsonObject profile, String characterId) {
+        Map<Long, Integer> used = new java.util.HashMap<>();
+        for (String component : new String[]{"characterInventories", "characterEquipment"}) {
+            JsonObject data = child(profile, component, "data");
+            if (data == null || characterId == null || !data.has(characterId)) {
+                continue;
+            }
+            for (JsonElement element : data.getAsJsonObject(characterId).getAsJsonArray("items")) {
+                JsonObject item = element.getAsJsonObject();
+                if (item.has("bucketHash")) {
+                    used.merge(item.get("bucketHash").getAsLong(), 1, Integer::sum);
+                }
+            }
+        }
+        return used;
+    }
+
+    /** A bucket's slot count, from the manifest. Cached, so this is one lookup per bucket. */
+    private int capacity(long bucketHash) {
+        try {
+            JsonObject definition = manifest.definition("DestinyInventoryBucketDefinition", bucketHash);
+            if (definition != null && definition.has("itemCount")) {
+                return definition.get("itemCount").getAsInt();
+            }
+        } catch (Exception e) {
+            // Fall through — assuming ten is far better than refusing to equip.
+        }
+        return ASSUMED_CAPACITY;
+    }
+
+    /**
+     * Sends one item from a full bucket to the vault so a transfer in can land.
+     *
+     * <p>Picks from the character's inventory rather than what is equipped, and never
+     * touches anything belonging to the loadout being applied — evicting an item we are
+     * about to put on would be a slow way of achieving nothing.
+     *
+     * @return the name of whatever was moved, or null if there was nothing safe to move
+     */
+    private String makeRoom(Store.User user, JsonObject profile, long bucketHash,
+                            java.util.Set<String> keep, String accessToken) throws IOException {
+        if (vaultFull(profile)) {
+            return null;
+        }
+
+        JsonObject inventories = child(profile, "characterInventories", "data");
+        if (inventories == null || !inventories.has(user.characterId)) {
+            return null;
+        }
+
+        for (JsonElement element : inventories.getAsJsonObject(user.characterId).getAsJsonArray("items")) {
+            JsonObject item = element.getAsJsonObject();
+            if (!item.has("itemInstanceId") || !item.has("bucketHash")
+                    || item.get("bucketHash").getAsLong() != bucketHash) {
+                continue;
+            }
+            String instanceId = item.get("itemInstanceId").getAsString();
+            if (keep.contains(instanceId)) {
+                continue;
+            }
+            long itemHash = item.get("itemHash").getAsLong();
+            try {
+                client.transferItem(user.membershipType, user.characterId, instanceId, itemHash,
+                        true, accessToken);
+            } catch (BungieClient.BungieException e) {
+                // Quest items and the like refuse to move; try the next candidate.
+                continue;
+            }
+            return itemName(new Store.Item(instanceId, itemHash, bucketHash));
+        }
+        return null;
+    }
+
+    /** Whether the vault has no room left, so pushing something out of a bucket would fail too. */
+    private boolean vaultFull(JsonObject profile) {
+        JsonObject vault = child(profile, "profileInventory", "data");
+        if (vault == null || !vault.has("items")) {
+            return false;
+        }
+        int count = 0;
+        for (JsonElement element : vault.getAsJsonArray("items")) {
+            JsonObject item = element.getAsJsonObject();
+            if (item.has("bucketHash") && item.get("bucketHash").getAsLong() == VAULT_BUCKET) {
+                count++;
+            }
+        }
+        return count >= capacity(VAULT_BUCKET);
+    }
+
+    /** Where an item lands on a character. Falls back to the manifest if the set predates it. */
+    private long destinationBucket(Store.Item item) {
+        if (item.bucketHash != 0) {
+            return item.bucketHash;
+        }
+        try {
+            JsonObject definition = manifest.definition(ITEM_DEFINITION, item.itemHash);
+            JsonObject inventory = definition == null ? null : child(definition, "inventory");
+            if (inventory != null && inventory.has("bucketTypeHash")) {
+                return inventory.get("bucketTypeHash").getAsLong();
+            }
+        } catch (Exception e) {
+            // Unknown bucket just means the capacity check is skipped for this item.
+        }
+        return 0;
     }
 
     private Store.Item byInstance(List<Store.Item> items, String instanceId) {
