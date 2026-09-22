@@ -48,6 +48,9 @@ final class Manifest {
     private static final String ITEM_TABLE = "DestinyInventoryItemDefinition";
     private static final String ACTIVITY_TABLE = "DestinyActivityDefinition";
     private static final String BUCKET_TABLE = "DestinyInventoryBucketDefinition";
+    private static final String VENDOR_TABLE = "DestinyVendorDefinition";
+    private static final String DESTINATION_TABLE = "DestinyDestinationDefinition";
+    private static final String OBJECTIVE_TABLE = "DestinyObjectiveDefinition";
 
     private final BungieClient client;
     private final ManifestCache fallback;
@@ -57,6 +60,9 @@ final class Manifest {
     private volatile Map<Long, String> activities = Map.of();
     private volatile Map<Long, Integer> bucketCapacity = Map.of();
     private volatile Map<Long, String> bucketNames = Map.of();
+    private volatile Map<Long, String> vendors = Map.of();
+    private volatile Map<Long, String> destinations = Map.of();
+    private volatile Map<Long, Objective> objectives = Map.of();
     private volatile String version = null;
 
     Manifest(BungieClient client, ManifestCache fallback) {
@@ -92,16 +98,23 @@ final class Manifest {
         Map<Long, Integer> capacities = new HashMap<>();
         Map<Long, String> bucketLabels = new HashMap<>();
         readBuckets(paths.get(BUCKET_TABLE).getAsString(), capacities, bucketLabels);
+        Map<Long, String> loadedVendors = readNames(paths.get(VENDOR_TABLE).getAsString());
+        Map<Long, String> loadedDestinations = readNames(paths.get(DESTINATION_TABLE).getAsString());
+        Map<Long, Objective> loadedObjectives = readObjectives(paths.get(OBJECTIVE_TABLE).getAsString());
 
         items = loadedItems;
         activities = loadedActivities;
         bucketCapacity = capacities;
         bucketNames = bucketLabels;
+        vendors = loadedVendors;
+        destinations = loadedDestinations;
+        objectives = loadedObjectives;
         version = newVersion;
 
         System.out.println("Manifest " + newVersion + " loaded in "
                 + (System.currentTimeMillis() - started) + "ms: "
-                + loadedItems.size() + " items, " + loadedActivities.size() + " activities");
+                + loadedItems.size() + " items, " + loadedActivities.size() + " activities, "
+                + loadedVendors.size() + " vendors, " + loadedObjectives.size() + " objectives");
     }
 
     // ---------------------------------------------------------------- lookups
@@ -161,19 +174,7 @@ final class Manifest {
      * Fall" almost always means all of them.
      */
     List<Long> findActivities(String query) {
-        String needle = query.trim().toLowerCase(Locale.ROOT);
-        List<Long> exact = new ArrayList<>();
-        List<Long> partial = new ArrayList<>();
-        for (Map.Entry<Long, String> entry : activities.entrySet()) {
-            String name = entry.getValue().toLowerCase(Locale.ROOT);
-            if (name.equals(needle)) {
-                exact.add(entry.getKey());
-            } else if (name.contains(needle)) {
-                partial.add(entry.getKey());
-            }
-        }
-        // An exact name match should not be diluted by everything containing it.
-        return exact.isEmpty() ? partial : exact;
+        return matching(activities, query);
     }
 
     /** Distinct activity names matching a query, for telling someone what they could have meant. */
@@ -229,6 +230,139 @@ final class Manifest {
     String artifactName(long hash) {
         String name = viaFallback("DestinyArtifactDefinition", hash);
         return name == null ? "Seasonal Artifact" : name;
+    }
+
+    /** What a bounty or quest step is asking for, and how much of it is needed. */
+    record Objective(String description, int completionValue) {
+    }
+
+    String vendorName(long hash) {
+        String name = vendors.get(hash);
+        if (name != null) {
+            return name;
+        }
+        String live = viaFallback(VENDOR_TABLE, hash);
+        return live == null ? "Vendor " + hash : live;
+    }
+
+    String destinationName(long hash) {
+        String name = destinations.get(hash);
+        if (name != null) {
+            return name;
+        }
+        String live = viaFallback(DESTINATION_TABLE, hash);
+        return live == null ? "Destination " + hash : live;
+    }
+
+    Objective objective(long hash) {
+        return objectives.get(hash);
+    }
+
+    /** Vendors whose name contains the query, exact matches first. */
+    List<Long> findVendors(String query) {
+        return matching(vendors, query);
+    }
+
+    List<Long> findDestinations(String query) {
+        return matching(destinations, query);
+    }
+
+    /** Distinct names from a set of hashes, for offering alternatives. */
+    List<String> namesOf(Map<Long, String> table, List<Long> hashes) {
+        List<String> names = new ArrayList<>();
+        for (Long hash : hashes) {
+            String name = table.get(hash);
+            if (name != null && !names.contains(name)) {
+                names.add(name);
+            }
+        }
+        return names;
+    }
+
+    List<String> vendorNamesMatching(String query) {
+        return namesOf(vendors, findVendors(query));
+    }
+
+    List<String> destinationNamesMatching(String query) {
+        return namesOf(destinations, findDestinations(query));
+    }
+
+    /**
+     * Hashes whose name matches a query, preferring precision but never at the cost of
+     * missing the thing people actually mean.
+     *
+     * <p>The subtlety is that a raid's real activities are named for their version — the
+     * bare "Vault of Glass" is a container with no completions against it, while every clear
+     * is recorded against "Vault of Glass: Standard". Returning only the exact match
+     * therefore answers "never completed" for a raid cleared seventeen times.
+     *
+     * <p>So an exact match is returned <em>together with</em> its variants: names that
+     * continue past the query with a separator. Only when neither exists does this fall back
+     * to a loose contains, which stops "Vault of Glass" also dragging in anything that merely
+     * mentions it.
+     */
+    private static List<Long> matching(Map<Long, String> table, String query) {
+        String needle = query.trim().toLowerCase(Locale.ROOT);
+        List<Long> direct = new ArrayList<>();
+        List<Long> loose = new ArrayList<>();
+        for (Map.Entry<Long, String> entry : table.entrySet()) {
+            String name = entry.getValue().toLowerCase(Locale.ROOT);
+            if (name.equals(needle) || isVariantOf(name, needle)) {
+                direct.add(entry.getKey());
+            } else if (name.contains(needle)) {
+                loose.add(entry.getKey());
+            }
+        }
+        return direct.isEmpty() ? loose : direct;
+    }
+
+    /** Whether {@code name} is the needle followed by a version, e.g. "…: Master". */
+    private static boolean isVariantOf(String name, String needle) {
+        if (!name.startsWith(needle) || name.length() <= needle.length()) {
+            return false;
+        }
+        char next = name.charAt(needle.length());
+        return next == ':' || next == ' ' || next == '-' || next == ',';
+    }
+
+    private Map<Long, Objective> readObjectives(String path) throws IOException {
+        Map<Long, Objective> out = new HashMap<>();
+        try (JsonReader reader = open(path)) {
+            reader.beginObject();
+            while (reader.hasNext()) {
+                long hash = Long.parseLong(reader.nextName());
+                String description = null;
+                String fallbackName = null;
+                int completion = 0;
+                reader.beginObject();
+                while (reader.hasNext()) {
+                    switch (reader.nextName()) {
+                        case "progressDescription" -> description = reader.nextString();
+                        case "completionValue" -> completion = reader.nextInt();
+                        case "displayProperties" -> {
+                            reader.beginObject();
+                            while (reader.hasNext()) {
+                                if ("name".equals(reader.nextName())) {
+                                    fallbackName = reader.nextString();
+                                } else {
+                                    reader.skipValue();
+                                }
+                            }
+                            reader.endObject();
+                        }
+                        default -> reader.skipValue();
+                    }
+                }
+                reader.endObject();
+                // progressDescription is the bar's label and is often blank; the display name
+                // is the next best thing to show for a step with no description of its own.
+                String label = description != null && !description.isBlank() ? description
+                        : (fallbackName == null ? "" : fallbackName);
+                out.put(hash, new Objective(label, completion));
+            }
+            reader.endObject();
+        }
+        return out;
     }
 
     private String viaFallback(String table, long hash) {

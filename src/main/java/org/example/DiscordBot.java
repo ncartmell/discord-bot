@@ -41,6 +41,8 @@ public class DiscordBot extends ListenerAdapter {
     private final Manifest names = new Manifest(bungie, manifest);
     private final Store store = new Store();
     private final Ghost ghost = new Ghost(bungie, names, store);
+    private final Stats stats = new Stats(bungie, names, store);
+    private final Vendors vendors = new Vendors(bungie, names, store, ghost);
     private BackgroundThread watcher;
 
     /**
@@ -141,6 +143,39 @@ public class DiscordBot extends ListenerAdapter {
                 Commands.slash("artifact", "Your seasonal artifact and which perks are active"),
 
                 Commands.slash("postmaster", "What's waiting in your postmaster"),
+
+                Commands.slash("xur", "What Xûr is selling this weekend"),
+
+                Commands.slash("vendor", "What a vendor is selling you")
+                        .addOption(STRING, "name", "Vendor name, e.g. Banshee-44", true),
+
+                Commands.slash("recent", "Your last few activities")
+                        .addOptions(new OptionData(INTEGER, "count", "How many to show")
+                                .setRequiredRange(1, 15)),
+
+                Commands.slash("pgcr", "The full breakdown of an activity")
+                        .addOption(STRING, "instance", "Instance id — defaults to your last activity"),
+
+                Commands.slash("clears", "How many times you've completed an activity")
+                        .addOption(STRING, "activity", "Activity name, e.g. Vault of Glass", true),
+
+                Commands.slash("weapon", "Your kills with one weapon")
+                        .addOption(STRING, "name", "Weapon name", true),
+
+                Commands.slash("topweapons", "Your most used weapons")
+                        .addOptions(new OptionData(INTEGER, "count", "How many to show")
+                                .setRequiredRange(1, 20)),
+
+                Commands.slash("bounties", "Your bounties and quest steps, with progress"),
+
+                Commands.slash("fireteam", "Who you're playing with right now"),
+
+                Commands.slash("currencies", "Glimmer and the rest"),
+
+                Commands.slash("lock", "Lock or unlock every item in a saved set")
+                        .addOptions(loadoutName().setName("set").setDescription("Which set")
+                                .setRequired(true))
+                        .addOption(BOOLEAN, "locked", "True to lock, false to unlock"),
 
                 Commands.slash("snapshot", "Save your current gear into an in-game loadout slot")
                         .addOptions(new OptionData(INTEGER, "slot", "Which of the 20 slots", true)
@@ -256,6 +291,47 @@ public class DiscordBot extends ListenerAdapter {
             case "postmaster":
                 postmaster(event, discordId);
                 break;
+            case "xur":
+                destiny(event, false, vendors::xur);
+                break;
+            case "vendor":
+                destiny(event, false, () ->
+                        vendors.vendor(discordId, event.getOption("name").getAsString()));
+                break;
+            case "recent":
+                destiny(event, false, () ->
+                        stats.recent(discordId, event.getOption("count", 5, OptionMapping::getAsInt)));
+                break;
+            case "pgcr":
+                destiny(event, false, () -> stats.pgcr(discordId,
+                        event.getOption("instance", null, OptionMapping::getAsString)));
+                break;
+            case "clears":
+                destiny(event, false, () ->
+                        stats.clears(discordId, event.getOption("activity").getAsString()));
+                break;
+            case "weapon":
+                destiny(event, false, () ->
+                        stats.weapon(discordId, event.getOption("name").getAsString()));
+                break;
+            case "topweapons":
+                destiny(event, false, () ->
+                        stats.topWeapons(discordId, event.getOption("count", 10, OptionMapping::getAsInt)));
+                break;
+            case "bounties":
+                destiny(event, false, () -> ghost.bounties(discordId));
+                break;
+            case "fireteam":
+                destiny(event, false, () -> ghost.fireteam(discordId));
+                break;
+            case "currencies":
+                destiny(event, true, () -> ghost.currencies(discordId));
+                break;
+            case "lock":
+                destiny(event, false, () -> ghost.lockSet(discordId,
+                        event.getOption("set").getAsString(),
+                        event.getOption("locked", true, OptionMapping::getAsBoolean)));
+                break;
             case "shaders":
                 event.reply("I'll shade you").setEphemeral(true).queue();
                 break;
@@ -289,8 +365,12 @@ public class DiscordBot extends ListenerAdapter {
     @Override
     public void onCommandAutoCompleteInteraction(CommandAutoCompleteInteractionEvent event)
     {
-        if (!event.getFocusedOption().getName().equals("name")
-                && !event.getFocusedOption().getName().equals("loadout"))
+        // /equip and /loadout call it "name", /map calls it "loadout", /lock calls it "set".
+        String option = event.getFocusedOption().getName();
+        if (!option.equals("name") && !option.equals("loadout") && !option.equals("set"))
+            return;
+        // /item and /weapon also take a "name", but theirs is an item, not a saved set.
+        if (event.getName().equals("item") || event.getName().equals("weapon"))
             return;
 
         String typed = event.getFocusedOption().getValue().toLowerCase(Locale.ROOT);
@@ -358,6 +438,18 @@ public class DiscordBot extends ListenerAdapter {
                     case "activity" -> ghost.activity(discordId);
                     case "artifact" -> ghost.artifact(discordId);
                     case "postmaster" -> null;   // handled below, it carries a menu
+                    case "xur" -> vendors.xur();
+                    case "vendor" -> vendors.vendor(discordId, argument);
+                    case "recent" -> stats.recent(discordId, number(argument, 5, 15));
+                    case "pgcr" -> stats.pgcr(discordId, argument.isEmpty() ? null : argument);
+                    case "clears" -> stats.clears(discordId, argument);
+                    case "weapon" -> stats.weapon(discordId, argument);
+                    case "topweapons" -> stats.topWeapons(discordId, number(argument, 10, 20));
+                    case "bounties" -> ghost.bounties(discordId);
+                    case "fireteam" -> ghost.fireteam(discordId);
+                    case "currencies" -> ghost.currencies(discordId);
+                    case "lock" -> ghost.lockSet(discordId, argument, true);
+                    case "unlock" -> ghost.lockSet(discordId, argument, false);
                     // No bare "!name" shorthand: every command is an explicit verb, so the
                     // bot never has to guess whether "!roll" was meant for it or another bot.
                     default -> null;
@@ -392,7 +484,22 @@ public class DiscordBot extends ListenerAdapter {
      */
     private static final java.util.Set<String> KNOWN_VERBS = java.util.Set.of(
             "loadout", "loadouts", "set", "save", "equip", "activityloadout", "map",
-            "activity", "artifact", "postmaster");
+            "activity", "artifact", "postmaster", "xur", "vendor", "recent", "pgcr",
+            "clears", "weapon", "topweapons", "bounties", "fireteam", "currencies",
+            "lock", "unlock");
+
+    /** Parses a count from a prefix argument, falling back when it is missing or nonsense. */
+    private static int number(String argument, int fallback, int limit)
+    {
+        try
+        {
+            return Math.max(1, Math.min(limit, Integer.parseInt(argument.trim())));
+        }
+        catch (RuntimeException e)
+        {
+            return fallback;
+        }
+    }
 
     /**
      * Answers {@code /postmaster} with the contents plus a menu to pull things back out.

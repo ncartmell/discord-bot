@@ -16,6 +16,12 @@ act as a ghost: link an account, see what you're playing, and put gear on.
 | `/news` | The latest articles from Bungie.net |
 | `/profile <name>` | Lifetime PvE stats for a Bungie name, e.g. `Guardian#1234` |
 | `/watch` | Announce the weekly rotation in this channel when it changes |
+| `/xur` | What Xûr is selling, with prices |
+| `/recent [count]` | Your last few activities, newest first |
+| `/pgcr [instance]` | Full breakdown of an activity — everyone's kills, deaths, assists |
+| `/clears <activity>` | Completions and fastest time, across all characters |
+| `/weapon <name>` | Kills and precision kills with one weapon |
+| `/topweapons [count]` | Your most used weapons |
 
 ### Your account — needs OAuth
 
@@ -30,6 +36,11 @@ act as a ghost: link an account, see what you're playing, and put gear on.
 | `/artifact` | Your seasonal artifact and which perks are active (read-only) |
 | `/equip <name>` | Put a set on — or queue it until you're next in orbit |
 | `/postmaster` | What's waiting in your postmaster, with a menu to pull items back |
+| `/bounties` | Bounties and quest steps, with progress on each |
+| `/fireteam` | Who you're playing with right now |
+| `/currencies` | Glimmer and the rest |
+| `/vendor <name>` | What a vendor is selling you |
+| `/lock <set> [locked]` | Lock every item in a saved set so it can't be dismantled |
 | `/map <loadout> [activity]` | Bind a set to the activity you're in, or one named outright |
 | `/unmap` | Remove that binding |
 | `/activityloadout` | Equip whatever is mapped to the activity you're in |
@@ -51,6 +62,10 @@ wrong in either direction is worse than typing a verb.
 | `!equip` | Equip whatever is mapped to the activity you're in |
 | `!map <name>` | Bind a set to the activity you're in |
 | `!activity` / `!artifact` / `!postmaster` | As their slash equivalents |
+| `!xur`, `!vendor <name>` | Vendor stock |
+| `!recent`, `!pgcr`, `!clears`, `!weapon`, `!topweapons` | Stats |
+| `!bounties`, `!fireteam`, `!currencies` | Account |
+| `!lock <set>` / `!unlock <set>` | Lock or unlock a saved set |
 
 ### Moderation
 
@@ -215,6 +230,40 @@ missing payload as a failure.
 **Checkpoints are not in the API.** There is no component exposing which encounter a
 fireteam is on, so a loadout cannot be bound to one. Binding is per activity hash, and a
 raid's normal and master versions are separate hashes — which is usually what you want.
+
+## Notes on the stats and vendor endpoints
+
+**Carnage reports only come from `stats.bungie.net`.** The same path on `www.bungie.net`
+answers 301, and `HttpURLConnection` will not follow a redirect to a different host, so a
+report fetched from the usual base arrives as an empty body rather than an error. Worth
+knowing because nothing in the docs mentions it.
+
+**Stats are per character, so they are summed here.** `UniqueWeapons` and
+`AggregateActivityStats` are character-scoped. "My best weapon" is an account-level
+question, and an answer that silently excluded two of three characters would be worse than
+no answer, so these fan out across every character and total the results.
+
+**Matching an activity by name has to include its versions.** The bare "Vault of Glass" is
+a container with no completions recorded against it; every clear is filed under "Vault of
+Glass: Standard" or ": Master". Matching only the exact name therefore reports a raid
+cleared 84 times as never completed. `Manifest.matching` returns an exact match *together
+with* names that continue past it with a separator, and falls back to a loose contains only
+when neither exists.
+
+**Fastest-completion times include checkpoint runs.**
+`fastestCompletionMsForActivity` counts any completion, so a four-minute King's Fall is a
+final-encounter run rather than a full clear. The footer says so rather than implying a
+record.
+
+**Xûr needs no token; every other vendor does.** His stock is identical for everyone, so it
+comes back from `/Destiny2/Vendors/` with an API key alone. Other vendors filter their
+inventory by what you have bought, your rank and your class, so the per-character endpoint
+refuses with error 12 without the owner's token.
+
+**Vendor sale items carry their costs.** Each entry has a `costs` array of item hash and
+quantity, which is how prices are shown. An empty array is also the most reliable way to
+tell a real item from a category header — those, and the vendor's own entry, appear in
+`saleItems` alongside actual stock.
 
 ## Configuration
 

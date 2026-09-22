@@ -125,6 +125,20 @@ final class Store {
         return users.computeIfAbsent(discordId, id -> new User());
     }
 
+    /**
+     * Returns a fully linked user, or fails with a message worth showing.
+     *
+     * <p>Lives here rather than in one of the callers because several unrelated features
+     * need the same check before they can do anything.
+     */
+    User requireLinked(String discordId) throws java.io.IOException {
+        User user = user(discordId);
+        if (!user.isLinked()) {
+            throw new java.io.IOException("No Destiny account linked — run `/link` first.");
+        }
+        return user;
+    }
+
     /** Returns the record for a Discord user, or null. Use when a lookup should not create one. */
     User peek(String discordId) {
         return users.get(discordId);

@@ -50,6 +50,8 @@ final class Ghost {
     private static final long SUBCLASS_BUCKET = 3284755031L;
     /** The postmaster, which the game calls "Lost Items". 21 slots, per character. */
     private static final long POSTMASTER_BUCKET = 215593132L;
+    /** Where bounties and quest steps live. The game calls it Quests. */
+    private static final long QUESTS_BUCKET = 1345459588L;
     /** Warn from here up, since the postmaster starts dropping things once it overflows. */
     private static final int POSTMASTER_WARN_AT = 17;
     /** A ceiling on plug writes per equip, so a wildly stale set cannot run away. */
@@ -185,6 +187,11 @@ final class Ghost {
      * <p>Access tokens last an hour and refresh tokens 90 days, so in practice this
      * refreshes on most calls and the user re-links roughly never.
      */
+    /** A valid access token for a linked user, for the features that live outside this class. */
+    String accessToken(Store.User user) throws IOException {
+        return token(user);
+    }
+
     private String token(Store.User user) throws IOException {
         long now = System.currentTimeMillis() / 1000;
         if (user.accessToken != null && user.accessTokenExpiresAt - RENEW_MARGIN > now) {
@@ -484,6 +491,216 @@ final class Ghost {
             }
         }
         return false;
+    }
+
+    /**
+     * Bounties and quest steps, with how far along each one is.
+     *
+     * <p>Needs the token twice over: the pursuits sit in character inventories (201) and
+     * their progress is an item component (301), and neither returns data for a profile
+     * that is not the caller's own.
+     */
+    MessageEmbed bounties(String discordId) throws IOException {
+        Store.User user = requireLinked(discordId);
+        JsonObject profile = client.profile(user.membershipType, user.membershipId, "201,301",
+                token(user));
+
+        JsonObject inventories = child(profile, "characterInventories", "data");
+        if (inventories == null || !inventories.has(user.characterId)) {
+            return Destiny.error("Couldn't read your inventory.");
+        }
+        JsonObject objectives = child(profile, "itemComponents", "objectives", "data");
+
+        List<String> done = new ArrayList<>();
+        List<String> active = new ArrayList<>();
+
+        for (JsonElement element : inventories.getAsJsonObject(user.characterId).getAsJsonArray("items")) {
+            JsonObject item = element.getAsJsonObject();
+            if (!item.has("bucketHash") || item.get("bucketHash").getAsLong() != QUESTS_BUCKET) {
+                continue;
+            }
+            String name = manifest.itemName(item.get("itemHash").getAsLong());
+            String instanceId = item.has("itemInstanceId") ? item.get("itemInstanceId").getAsString() : null;
+
+            List<String> steps = new ArrayList<>();
+            boolean complete = true;
+            if (instanceId != null && objectives != null && objectives.has(instanceId)) {
+                JsonArray list = objectives.getAsJsonObject(instanceId).getAsJsonArray("objectives");
+                if (list != null) {
+                    for (JsonElement objectiveElement : list) {
+                        JsonObject objective = objectiveElement.getAsJsonObject();
+                        if (objective.has("visible") && !objective.get("visible").getAsBoolean()) {
+                            continue;
+                        }
+                        boolean stepDone = objective.has("complete")
+                                && objective.get("complete").getAsBoolean();
+                        complete &= stepDone;
+
+                        int progress = objective.has("progress") ? objective.get("progress").getAsInt() : 0;
+                        int target = objective.has("completionValue")
+                                ? objective.get("completionValue").getAsInt() : 0;
+                        Manifest.Objective definition =
+                                manifest.objective(objective.get("objectiveHash").getAsLong());
+                        String label = definition == null || definition.description().isBlank()
+                                ? "Progress" : definition.description();
+                        steps.add("   " + (stepDone ? "✓ " : "") + label
+                                + (target > 0 ? " — " + Math.min(progress, target) + "/" + target : ""));
+                    }
+                }
+            }
+            if (steps.isEmpty()) {
+                complete = false;
+            }
+
+            String entry = "**" + name + "**" + (steps.isEmpty() ? "" : "\n" + String.join("\n", steps));
+            (complete ? done : active).add(entry);
+        }
+
+        if (active.isEmpty() && done.isEmpty()) {
+            return simple("Bounties", "Nothing tracked. Your Quests tab is empty.");
+        }
+
+        EmbedBuilder embed = new EmbedBuilder()
+                .setTitle("Bounties and quests")
+                .setColor(ACCENT)
+                .setDescription((active.size() + done.size()) + " of "
+                        + Math.max(1, manifest.bucketCapacity(QUESTS_BUCKET)) + " slots used");
+        if (!done.isEmpty()) {
+            embed.addField("Ready to hand in (" + done.size() + ")", join(done), false);
+        }
+        if (!active.isEmpty()) {
+            embed.addField("In progress (" + active.size() + ")", join(active), false);
+        }
+        return embed.build();
+    }
+
+    /**
+     * Who you are playing with right now.
+     *
+     * <p>The transitory component only exists while you are actually in game — Bungie drops
+     * it the moment you stop — so an empty answer here means "not playing", not "alone".
+     */
+    MessageEmbed fireteam(String discordId) throws IOException {
+        Store.User user = requireLinked(discordId);
+        JsonObject transitory = child(client.profile(user.membershipType, user.membershipId,
+                "1000", token(user)), "profileTransitoryData", "data");
+
+        if (transitory == null) {
+            return simple("Fireteam", "Nothing to show — this only reports while you're in game.");
+        }
+
+        List<String> members = new ArrayList<>();
+        JsonArray party = transitory.getAsJsonArray("partyMembers");
+        if (party != null) {
+            for (JsonElement element : party) {
+                JsonObject member = element.getAsJsonObject();
+                members.add("• " + string(member, "displayName"));
+            }
+        }
+
+        EmbedBuilder embed = new EmbedBuilder().setTitle("Fireteam").setColor(ACCENT);
+
+        JsonObject current = transitory.has("currentActivity")
+                && transitory.get("currentActivity").isJsonObject()
+                ? transitory.getAsJsonObject("currentActivity") : null;
+        if (current != null && current.has("startTime")) {
+            embed.setDescription("In an activity since " + string(current, "startTime"));
+        }
+
+        embed.addField(members.isEmpty() ? "Nobody with you" : "Members (" + members.size() + ")",
+                members.isEmpty() ? "Playing solo, or not in game." : join(members), false);
+
+        JsonObject joinability = transitory.has("joinability")
+                && transitory.get("joinability").isJsonObject()
+                ? transitory.getAsJsonObject("joinability") : null;
+        if (joinability != null && joinability.has("openSlots")) {
+            int open = joinability.get("openSlots").getAsInt();
+            embed.addField("Open slots", open <= 0 ? "Full" : String.valueOf(open), true);
+        }
+
+        if (transitory.has("lastOrbitedDestinationHash")) {
+            long destination = transitory.get("lastOrbitedDestinationHash").getAsLong();
+            if (destination != 0) {
+                embed.addField("Last orbited", manifest.destinationName(destination), true);
+            }
+        }
+        return embed.build();
+    }
+
+    /** Glimmer and the rest of what the game counts as currency. */
+    MessageEmbed currencies(String discordId) throws IOException {
+        Store.User user = requireLinked(discordId);
+        JsonObject currencies = child(client.profile(user.membershipType, user.membershipId,
+                "103", token(user)), "profileCurrencies", "data");
+
+        if (currencies == null || !currencies.has("items")) {
+            return Destiny.error("Couldn't read your currencies.");
+        }
+
+        List<String> lines = new ArrayList<>();
+        for (JsonElement element : currencies.getAsJsonArray("items")) {
+            JsonObject item = element.getAsJsonObject();
+            int quantity = item.has("quantity") ? item.get("quantity").getAsInt() : 0;
+            if (quantity <= 0) {
+                continue;
+            }
+            lines.add("**" + manifest.itemName(item.get("itemHash").getAsLong()) + "** — "
+                    + String.format(java.util.Locale.UK, "%,d", quantity));
+        }
+
+        if (lines.isEmpty()) {
+            return simple("Currencies", "Nothing to report.");
+        }
+        return new EmbedBuilder()
+                .setTitle("Currencies")
+                .setColor(ACCENT)
+                .setDescription(join(lines))
+                .build();
+    }
+
+    /**
+     * Locks or unlocks every item in a saved set.
+     *
+     * <p>The natural companion to sets built from instance ids: a set names one specific
+     * roll, and nothing otherwise stops that roll being dismantled in a tidying session.
+     */
+    MessageEmbed lockSet(String discordId, String rawName, boolean locked) throws IOException {
+        Store.User user = requireLinked(discordId);
+        String name = normalise(rawName);
+        List<Store.Item> items = user.loadouts.get(name);
+        if (items == null) {
+            return Destiny.error("No loadout called `" + name + "`.");
+        }
+
+        String accessToken = token(user);
+        int changed = 0;
+        List<String> failed = new ArrayList<>();
+        for (Store.Item item : items) {
+            try {
+                client.setLockState(user.membershipType, user.characterId, item.instanceId,
+                        locked, accessToken);
+                changed++;
+            } catch (BungieClient.BungieException e) {
+                // Subclasses and other non-lockable things refuse; that is not a failure
+                // worth shouting about, but an unexpected code is.
+                if (e.code != 1640 && e.code != 1623) {
+                    failed.add(itemName(item) + " — " + reason(e.code));
+                }
+            } catch (IOException e) {
+                failed.add(itemName(item) + " — " + e.getMessage());
+            }
+        }
+
+        EmbedBuilder embed = new EmbedBuilder()
+                .setTitle((locked ? "Locked " : "Unlocked ") + name)
+                .setColor(ACCENT)
+                .setDescription(changed + " of " + items.size() + " items "
+                        + (locked ? "locked." : "unlocked.")
+                        + (locked ? "\n\nThey can't be dismantled until you unlock them." : ""));
+        if (!failed.isEmpty()) {
+            embed.addField("Skipped", join(failed), false);
+        }
+        return embed.build();
     }
 
     /** One thing waiting in the postmaster, in a form the interface can offer back. */
@@ -1343,11 +1560,7 @@ final class Ghost {
     }
 
     private Store.User requireLinked(String discordId) throws IOException {
-        Store.User user = store.user(discordId);
-        if (!user.isLinked()) {
-            throw new IOException("No Destiny account linked — run `/link` first.");
-        }
-        return user;
+        return store.requireLinked(discordId);
     }
 
     private static String characterSummary(JsonObject characters, String characterId) {

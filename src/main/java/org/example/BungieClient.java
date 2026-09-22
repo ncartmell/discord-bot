@@ -22,6 +22,14 @@ import java.nio.charset.StandardCharsets;
 public class BungieClient {
 
     private static final String BASE = "https://www.bungie.net/Platform";
+    /**
+     * Post-game carnage reports are only served from this host.
+     *
+     * <p>The same path on {@code www.bungie.net} answers 301, and HttpURLConnection will not
+     * follow a redirect to a different host, so a report fetched from the usual base comes
+     * back as an empty body rather than an error.
+     */
+    private static final String STATS_BASE = "https://stats.bungie.net/Platform";
     private static final String API_KEY = Config.require("BUNGIE_API_KEY");
 
     /** Bungie returns HTTP 200 with an error code in the body, so success must be checked explicitly. */
@@ -30,9 +38,14 @@ public class BungieClient {
     // ---------------------------------------------------------------- transport
 
     private JsonObject send(String method, String path, String body, String bearer) throws IOException {
+        return send(BASE, method, path, body, bearer);
+    }
+
+    private JsonObject send(String base, String method, String path, String body, String bearer)
+            throws IOException {
         HttpURLConnection con;
         try {
-            con = (HttpURLConnection) new URI(BASE + path).toURL().openConnection();
+            con = (HttpURLConnection) new URI(base + path).toURL().openConnection();
         } catch (Exception e) {
             throw new IOException("Bad request URI: " + path, e);
         }
@@ -180,6 +193,83 @@ public class BungieClient {
                     + " — the identifier is probably stale.");
         }
         return json.getAsJsonObject("Response");
+    }
+
+    /**
+     * Recent activities for a character, newest first.
+     *
+     * @param mode activity mode filter, 0 for everything
+     */
+    JsonArray activityHistory(int membershipType, String membershipId, String characterId,
+                              int count, int mode) throws IOException {
+        JsonObject response = response("/Destiny2/" + membershipType + "/Account/" + membershipId
+                + "/Character/" + characterId + "/Stats/Activities/?count=" + count
+                + "&mode=" + mode + "&page=0");
+        JsonArray activities = response.getAsJsonArray("activities");
+        return activities == null ? new JsonArray() : activities;
+    }
+
+    /** The full breakdown of one activity, including everyone who was in it. */
+    JsonObject postGameCarnageReport(String instanceId) throws IOException {
+        JsonObject json = send(STATS_BASE, "GET",
+                "/Destiny2/Stats/PostGameCarnageReport/" + instanceId + "/", null, null);
+        if (!json.has("Response") || json.get("Response").isJsonNull()) {
+            throw new IOException("No report for activity " + instanceId
+                    + " — reports are dropped after a while.");
+        }
+        return json.getAsJsonObject("Response");
+    }
+
+    /** Every activity the character has played, with completion counts and fastest times. */
+    JsonArray aggregateActivityStats(int membershipType, String membershipId, String characterId)
+            throws IOException {
+        JsonObject response = response("/Destiny2/" + membershipType + "/Account/" + membershipId
+                + "/Character/" + characterId + "/Stats/AggregateActivityStats/");
+        JsonArray activities = response.getAsJsonArray("activities");
+        return activities == null ? new JsonArray() : activities;
+    }
+
+    /** Per-weapon kill counts for a character. */
+    JsonArray uniqueWeapons(int membershipType, String membershipId, String characterId)
+            throws IOException {
+        JsonObject response = response("/Destiny2/" + membershipType + "/Account/" + membershipId
+                + "/Character/" + characterId + "/Stats/UniqueWeapons/");
+        JsonArray weapons = response.getAsJsonArray("weapons");
+        return weapons == null ? new JsonArray() : weapons;
+    }
+
+    /**
+     * Vendors whose stock is the same for everyone.
+     *
+     * <p>In practice this is Xûr, and usefully it needs no token — the per-character vendor
+     * endpoint refuses with error 12 without one.
+     */
+    JsonObject publicVendors(String components) throws IOException {
+        return response("/Destiny2/Vendors/?components=" + components);
+    }
+
+    /** Vendors available to one character, which is everything Xûr is not. */
+    JsonObject characterVendors(int membershipType, String membershipId, String characterId,
+                                String components, String accessToken) throws IOException {
+        String path = "/Destiny2/" + membershipType + "/Profile/" + membershipId
+                + "/Character/" + characterId + "/Vendors/?components=" + components;
+        JsonObject json = send("GET", path, null, accessToken);
+        if (!json.has("Response") || json.get("Response").isJsonNull()) {
+            throw new IOException("Bungie returned no vendor data.");
+        }
+        return json.getAsJsonObject("Response");
+    }
+
+    /** Locks or unlocks an item, which is what stops it being dismantled by accident. */
+    void setLockState(int membershipType, String characterId, String instanceId, boolean locked,
+                      String accessToken) throws IOException {
+        JsonObject body = new JsonObject();
+        body.addProperty("state", locked);
+        body.addProperty("itemId", Long.parseLong(instanceId));
+        body.addProperty("characterId", Long.parseLong(characterId));
+        body.addProperty("membershipType", membershipType);
+
+        postAs("/Destiny2/Actions/Items/SetLockState/", body.toString(), accessToken);
     }
 
     // ---------------------------------------------------------------- actions (OAuth)
