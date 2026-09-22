@@ -192,6 +192,16 @@ final class Ghost {
         return token(user);
     }
 
+    /**
+     * A token if one can be had, for reads that work either way.
+     *
+     * <p>Keeps a feature usable on public components when an authorisation has lapsed,
+     * rather than failing on a token it did not strictly need.
+     */
+    String accessTokenOrNull(Store.User user) {
+        return tokenOrNull(user);
+    }
+
     private String token(Store.User user) throws IOException {
         long now = System.currentTimeMillis() / 1000;
         if (user.accessToken != null && user.accessTokenExpiresAt - RENEW_MARGIN > now) {
@@ -228,7 +238,10 @@ final class Ghost {
     private String tokenOrNull(Store.User user) {
         try {
             return token(user);
-        } catch (IOException e) {
+        } catch (IOException | RuntimeException e) {
+            // RuntimeException matters as much as IOException here: a missing OAuth client id
+            // surfaces as IllegalStateException from Config, and a read that does not need a
+            // token should not fail because the bot has no OAuth configuration at all.
             return null;
         }
     }

@@ -40,6 +40,7 @@ act as a ghost: link an account, see what you're playing, and put gear on.
 | `/fireteam` | Who you're playing with right now |
 | `/currencies` | Glimmer and the rest |
 | `/vendor <name>` | What a vendor is selling you |
+| `/destination [name]` | What's live on a destination — omit the name for the list |
 | `/lock <set> [locked]` | Lock every item in a saved set so it can't be dismantled |
 | `/map <loadout> [activity]` | Bind a set to the activity you're in, or one named outright |
 | `/unmap` | Remove that binding |
@@ -64,7 +65,7 @@ wrong in either direction is worse than typing a verb.
 | `!activity` / `!artifact` / `!postmaster` | As their slash equivalents |
 | `!xur`, `!vendor <name>` | Vendor stock |
 | `!recent`, `!pgcr`, `!clears`, `!weapon`, `!topweapons` | Stats |
-| `!bounties`, `!fireteam`, `!currencies` | Account |
+| `!bounties`, `!fireteam`, `!currencies`, `!destination <name>` | Account and world |
 | `!lock <set>` / `!unlock <set>` | Lock or unlock a saved set |
 
 ### Moderation
@@ -254,6 +255,16 @@ when neither exists.
 `fastestCompletionMsForActivity` counts any completion, so a four-minute King's Fall is a
 final-encounter run rather than a full clear. The footer says so rather than implying a
 record.
+
+**There is no "what's on the Moon" endpoint.** What there is is `characterActivities`,
+which lists roughly 280 activities currently available to a character, each with its
+recommended power, difficulty and active modifiers. Cross-referencing that against each
+activity's `destinationHash` from the manifest gives the per-destination view, which is
+character-scoped by construction — it is what *you* can launch, so campaign progress and
+season are already accounted for.
+
+Many destination hashes are internal groupings with no display name; those are skipped
+rather than printed as a bare hash.
 
 **Xûr needs no token; every other vendor does.** His stock is identical for everyone, so it
 comes back from `/Destiny2/Vendors/` with an API key alone. Other vendors filter their

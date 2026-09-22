@@ -43,6 +43,7 @@ public class DiscordBot extends ListenerAdapter {
     private final Ghost ghost = new Ghost(bungie, names, store);
     private final Stats stats = new Stats(bungie, names, store);
     private final Vendors vendors = new Vendors(bungie, names, store, ghost);
+    private final World world = new World(bungie, names, store, ghost);
     private BackgroundThread watcher;
 
     /**
@@ -165,6 +166,9 @@ public class DiscordBot extends ListenerAdapter {
                 Commands.slash("topweapons", "Your most used weapons")
                         .addOptions(new OptionData(INTEGER, "count", "How many to show")
                                 .setRequiredRange(1, 20)),
+
+                Commands.slash("destination", "What's available on a destination")
+                        .addOption(STRING, "name", "e.g. The Moon — omit for the list"),
 
                 Commands.slash("bounties", "Your bounties and quest steps, with progress"),
 
@@ -318,6 +322,10 @@ public class DiscordBot extends ListenerAdapter {
                 destiny(event, false, () ->
                         stats.topWeapons(discordId, event.getOption("count", 10, OptionMapping::getAsInt)));
                 break;
+            case "destination":
+                destiny(event, false, () -> world.destination(discordId,
+                        event.getOption("name", null, OptionMapping::getAsString)));
+                break;
             case "bounties":
                 destiny(event, false, () -> ghost.bounties(discordId));
                 break;
@@ -445,6 +453,7 @@ public class DiscordBot extends ListenerAdapter {
                     case "clears" -> stats.clears(discordId, argument);
                     case "weapon" -> stats.weapon(discordId, argument);
                     case "topweapons" -> stats.topWeapons(discordId, number(argument, 10, 20));
+                    case "destination", "destinations" -> world.destination(discordId, argument);
                     case "bounties" -> ghost.bounties(discordId);
                     case "fireteam" -> ghost.fireteam(discordId);
                     case "currencies" -> ghost.currencies(discordId);
@@ -486,7 +495,7 @@ public class DiscordBot extends ListenerAdapter {
             "loadout", "loadouts", "set", "save", "equip", "activityloadout", "map",
             "activity", "artifact", "postmaster", "xur", "vendor", "recent", "pgcr",
             "clears", "weapon", "topweapons", "bounties", "fireteam", "currencies",
-            "lock", "unlock");
+            "lock", "unlock", "destination", "destinations");
 
     /** Parses a count from a prefix argument, falling back when it is missing or nonsense. */
     private static int number(String argument, int fallback, int limit)

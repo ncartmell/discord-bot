@@ -51,6 +51,8 @@ final class Manifest {
     private static final String VENDOR_TABLE = "DestinyVendorDefinition";
     private static final String DESTINATION_TABLE = "DestinyDestinationDefinition";
     private static final String OBJECTIVE_TABLE = "DestinyObjectiveDefinition";
+    private static final String MODIFIER_TABLE = "DestinyActivityModifierDefinition";
+    private static final String ACTIVITY_TYPE_TABLE = "DestinyActivityTypeDefinition";
 
     private final BungieClient client;
     private final ManifestCache fallback;
@@ -63,6 +65,10 @@ final class Manifest {
     private volatile Map<Long, String> vendors = Map.of();
     private volatile Map<Long, String> destinations = Map.of();
     private volatile Map<Long, Objective> objectives = Map.of();
+    /** Where each activity happens, kept alongside the names rather than replacing them. */
+    private volatile Map<Long, long[]> activityPlaces = Map.of();
+    private volatile Map<Long, String> modifiers = Map.of();
+    private volatile Map<Long, String> activityTypes = Map.of();
     private volatile String version = null;
 
     Manifest(BungieClient client, ManifestCache fallback) {
@@ -94,7 +100,10 @@ final class Manifest {
 
         long started = System.currentTimeMillis();
         Map<Long, Item> loadedItems = readItems(paths.get(ITEM_TABLE).getAsString());
-        Map<Long, String> loadedActivities = readNames(paths.get(ACTIVITY_TABLE).getAsString());
+        Map<Long, long[]> places = new HashMap<>();
+        Map<Long, String> loadedActivities = readActivities(paths.get(ACTIVITY_TABLE).getAsString(), places);
+        Map<Long, String> loadedModifiers = readNames(paths.get(MODIFIER_TABLE).getAsString());
+        Map<Long, String> loadedTypes = readNames(paths.get(ACTIVITY_TYPE_TABLE).getAsString());
         Map<Long, Integer> capacities = new HashMap<>();
         Map<Long, String> bucketLabels = new HashMap<>();
         readBuckets(paths.get(BUCKET_TABLE).getAsString(), capacities, bucketLabels);
@@ -109,6 +118,9 @@ final class Manifest {
         vendors = loadedVendors;
         destinations = loadedDestinations;
         objectives = loadedObjectives;
+        activityPlaces = places;
+        modifiers = loadedModifiers;
+        activityTypes = loadedTypes;
         version = newVersion;
 
         System.out.println("Manifest " + newVersion + " loaded in "
@@ -232,6 +244,78 @@ final class Manifest {
         return name == null ? "Seasonal Artifact" : name;
     }
 
+    /** The destination an activity takes place on, or 0 if it has none. */
+    long activityDestination(long activityHash) {
+        long[] place = activityPlaces.get(activityHash);
+        return place == null ? 0 : place[0];
+    }
+
+    /** The kind of activity — Raid, Strike, Patrol and so on. */
+    String activityType(long activityHash) {
+        long[] place = activityPlaces.get(activityHash);
+        if (place == null || place[1] == 0) {
+            return null;
+        }
+        return activityTypes.get(place[1]);
+    }
+
+    String modifierName(long hash) {
+        String name = modifiers.get(hash);
+        if (name != null) {
+            return name;
+        }
+        String live = viaFallback(MODIFIER_TABLE, hash);
+        return live == null ? null : live;
+    }
+
+    /**
+     * Activity names plus where each one happens, in one pass.
+     *
+     * <p>{@code places} is filled with {@code [destinationHash, activityTypeHash]} per
+     * activity — a two-element array rather than a record because there are thousands of
+     * them and this is read only by the two accessors above.
+     */
+    private Map<Long, String> readActivities(String path, Map<Long, long[]> places) throws IOException {
+        Map<Long, String> out = new HashMap<>();
+        try (JsonReader reader = open(path)) {
+            reader.beginObject();
+            while (reader.hasNext()) {
+                long hash = Long.parseLong(reader.nextName());
+                String name = null;
+                long destination = 0;
+                long type = 0;
+                reader.beginObject();
+                while (reader.hasNext()) {
+                    switch (reader.nextName()) {
+                        case "displayProperties" -> {
+                            reader.beginObject();
+                            while (reader.hasNext()) {
+                                if ("name".equals(reader.nextName())) {
+                                    name = reader.nextString();
+                                } else {
+                                    reader.skipValue();
+                                }
+                            }
+                            reader.endObject();
+                        }
+                        case "destinationHash" -> destination = reader.nextLong();
+                        case "activityTypeHash" -> type = reader.nextLong();
+                        default -> reader.skipValue();
+                    }
+                }
+                reader.endObject();
+                if (name != null && !name.isBlank()) {
+                    out.put(hash, name);
+                    if (destination != 0 || type != 0) {
+                        places.put(hash, new long[]{destination, type});
+                    }
+                }
+            }
+            reader.endObject();
+        }
+        return out;
+    }
+
     /** What a bounty or quest step is asking for, and how much of it is needed. */
     record Objective(String description, int completionValue) {
     }
@@ -246,12 +330,19 @@ final class Manifest {
     }
 
     String destinationName(long hash) {
+        String name = destinationNameOrNull(hash);
+        return name == null ? "Destination " + hash : name;
+    }
+
+    /**
+     * A destination's name, or null when it has none.
+     *
+     * <p>Plenty of destination hashes are internal groupings with no display name at all.
+     * Callers listing destinations want to skip those rather than print a bare hash.
+     */
+    String destinationNameOrNull(long hash) {
         String name = destinations.get(hash);
-        if (name != null) {
-            return name;
-        }
-        String live = viaFallback(DESTINATION_TABLE, hash);
-        return live == null ? "Destination " + hash : live;
+        return name != null ? name : viaFallback(DESTINATION_TABLE, hash);
     }
 
     Objective objective(long hash) {
