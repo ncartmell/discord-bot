@@ -15,6 +15,17 @@ final class Config {
     private Config() {
     }
 
+    /** Returns the value for {@code key}, or {@code fallback} if it is not set. */
+    static String optional(String key, String fallback) {
+        String value = DOTENV.get(key);
+        return value == null || value.isBlank() ? fallback : value;
+    }
+
+    /** Returns a boolean setting, treating anything other than "true" as false. */
+    static boolean flag(String key) {
+        return Boolean.parseBoolean(optional(key, "false"));
+    }
+
     /**
      * Returns the value for {@code key}, preferring a real environment variable and
      * falling back to {@code .env}.

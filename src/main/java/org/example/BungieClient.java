@@ -12,10 +12,12 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 
 /**
- * A thin client for the public parts of the Bungie.net API.
+ * A thin client for the Bungie.net API.
  *
- * <p>Everything here works with an API key alone. Anything under {@code /Destiny2/Actions/}
- * — equipping, transferring, loadouts — requires a full OAuth flow and is deliberately absent.
+ * <p>Most of this works with an API key alone, including everything the bot reads: profiles,
+ * characters, equipment, the vault and the current activity. Only the {@code /Destiny2/Actions/}
+ * endpoints act on a player's behalf, and those take an additional bearer token — see
+ * {@link OAuth}. Bungie wants both headers on an authenticated call, not just the bearer.
  */
 public class BungieClient {
 
@@ -27,7 +29,7 @@ public class BungieClient {
 
     // ---------------------------------------------------------------- transport
 
-    private JsonObject send(String method, String path, String body) throws IOException {
+    private JsonObject send(String method, String path, String body, String bearer) throws IOException {
         HttpURLConnection con;
         try {
             con = (HttpURLConnection) new URI(BASE + path).toURL().openConnection();
@@ -38,6 +40,9 @@ public class BungieClient {
         con.setRequestMethod(method);
         con.setRequestProperty("X-API-KEY", API_KEY);
         con.setRequestProperty("Accept", "application/json");
+        if (bearer != null) {
+            con.setRequestProperty("Authorization", "Bearer " + bearer);
+        }
         con.setConnectTimeout(10_000);
         con.setReadTimeout(15_000);
 
@@ -65,13 +70,22 @@ public class BungieClient {
         int errorCode = json.has("ErrorCode") ? json.get("ErrorCode").getAsInt() : -1;
         if (errorCode != SUCCESS) {
             String message = json.has("Message") ? json.get("Message").getAsString() : "unknown error";
-            throw new IOException("Bungie API error " + errorCode + ": " + message);
+            throw new BungieException(errorCode, message);
         }
         return json;
     }
 
     JsonObject get(String path) throws IOException {
-        return send("GET", path, null);
+        return send("GET", path, null, null);
+    }
+
+    JsonObject post(String path, String body) throws IOException {
+        return send("POST", path, body, null);
+    }
+
+    /** A POST made as the linked user. Required for anything under {@code /Destiny2/Actions/}. */
+    JsonObject postAs(String path, String body, String accessToken) throws IOException {
+        return send("POST", path, body, accessToken);
     }
 
     /**
@@ -90,11 +104,7 @@ public class BungieClient {
         return json.getAsJsonObject("Response");
     }
 
-    JsonObject post(String path, String body) throws IOException {
-        return send("POST", path, body);
-    }
-
-    // ---------------------------------------------------------------- endpoints
+    // ---------------------------------------------------------------- public endpoints
 
     /** Looks up a single manifest definition by hash. Prefer {@link ManifestCache} for repeat lookups. */
     JsonObject entityDefinition(String entityType, long hash) throws IOException {
@@ -129,5 +139,101 @@ public class BungieClient {
     /** Lifetime historical stats for an account, merged across all of its characters. */
     JsonObject accountStats(int membershipType, String membershipId) throws IOException {
         return response("/Destiny2/" + membershipType + "/Account/" + membershipId + "/Stats/");
+    }
+
+    /**
+     * The Destiny accounts attached to a Bungie.net membership.
+     *
+     * <p>The id OAuth hands back identifies the Bungie.net account, which is not the
+     * membership Destiny endpoints want. This is the step that turns one into the other.
+     */
+    JsonObject linkedProfiles(String bungieMembershipId) throws IOException {
+        return response("/Destiny2/254/Profile/" + bungieMembershipId
+                + "/LinkedProfiles/?getAllMemberships=true");
+    }
+
+    /**
+     * A profile with the requested components.
+     *
+     * @param components component numbers, e.g. 200 for characters, 205 for equipment
+     */
+    JsonObject profile(int membershipType, String membershipId, String components) throws IOException {
+        return response("/Destiny2/" + membershipType + "/Profile/" + membershipId
+                + "/?components=" + components);
+    }
+
+    // ---------------------------------------------------------------- actions (OAuth)
+
+    /**
+     * Equips a set of items by instance id.
+     *
+     * <p>Two behaviours from the endpoint's own documentation shape how callers must use
+     * this: it only works when the player is "in a social space, in orbit, or offline",
+     * and "any items not found on your character will be ignored" — so anything sitting
+     * in the vault is silently skipped rather than reported as an error.
+     *
+     * @return the per-item results, each with an {@code itemInstanceId} and {@code equipStatus}
+     */
+    JsonArray equipItems(int membershipType, String characterId, java.util.List<String> instanceIds,
+                         String accessToken) throws IOException {
+        JsonArray ids = new JsonArray();
+        for (String id : instanceIds) {
+            ids.add(Long.parseLong(id));
+        }
+
+        JsonObject body = new JsonObject();
+        body.add("itemIds", ids);
+        body.addProperty("characterId", Long.parseLong(characterId));
+        body.addProperty("membershipType", membershipType);
+
+        JsonObject json = postAs("/Destiny2/Actions/Items/EquipItems/", body.toString(), accessToken);
+        if (!json.has("Response") || json.get("Response").isJsonNull()) {
+            throw new IOException("Bungie accepted the equip but said nothing about what happened.");
+        }
+        JsonArray results = json.getAsJsonObject("Response").getAsJsonArray("equipResults");
+        return results == null ? new JsonArray() : results;
+    }
+
+    /** Moves one item between a character and the vault. */
+    void transferItem(int membershipType, String characterId, String instanceId, long itemHash,
+                      boolean toVault, String accessToken) throws IOException {
+        JsonObject body = new JsonObject();
+        body.addProperty("itemReferenceHash", itemHash);
+        body.addProperty("stackSize", 1);
+        body.addProperty("transferToVault", toVault);
+        body.addProperty("itemId", Long.parseLong(instanceId));
+        body.addProperty("characterId", Long.parseLong(characterId));
+        body.addProperty("membershipType", membershipType);
+
+        postAs("/Destiny2/Actions/Items/TransferItem/", body.toString(), accessToken);
+    }
+
+    /**
+     * Saves whatever the character is currently wearing into one of the 20 in-game loadout slots.
+     *
+     * <p>Unlike the equip endpoints this carries no documented restriction on where the
+     * player is, so it works mid-activity. It can only capture the current equipment
+     * though — there is no endpoint that writes arbitrary items into a slot.
+     */
+    void snapshotLoadout(int membershipType, String characterId, int loadoutIndex,
+                         String accessToken) throws IOException {
+        JsonObject body = new JsonObject();
+        body.addProperty("loadoutIndex", loadoutIndex);
+        body.addProperty("characterId", Long.parseLong(characterId));
+        body.addProperty("membershipType", membershipType);
+
+        postAs("/Destiny2/Actions/Loadouts/SnapshotLoadout/", body.toString(), accessToken);
+    }
+
+    /** A Bungie error code and message, kept apart so callers can react to specific codes. */
+    static final class BungieException extends IOException {
+        private static final long serialVersionUID = 1L;
+
+        final int code;
+
+        BungieException(int code, String message) {
+            super("Bungie API error " + code + ": " + message);
+            this.code = code;
+        }
     }
 }

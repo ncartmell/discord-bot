@@ -5,22 +5,27 @@ import net.dv8tion.jda.api.Permission;
 import net.dv8tion.jda.api.entities.Member;
 import net.dv8tion.jda.api.entities.User;
 import net.dv8tion.jda.api.entities.channel.middleman.MessageChannel;
+import net.dv8tion.jda.api.events.interaction.command.CommandAutoCompleteInteractionEvent;
 import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent;
 import net.dv8tion.jda.api.events.interaction.component.ButtonInteractionEvent;
-import net.dv8tion.jda.api.exceptions.HierarchyException;
+import net.dv8tion.jda.api.events.message.MessageReceivedEvent;
 import net.dv8tion.jda.api.hooks.ListenerAdapter;
 import net.dv8tion.jda.api.interactions.InteractionHook;
+import net.dv8tion.jda.api.interactions.commands.Command;
 import net.dv8tion.jda.api.interactions.commands.DefaultMemberPermissions;
 import net.dv8tion.jda.api.interactions.commands.OptionMapping;
 import net.dv8tion.jda.api.interactions.commands.build.Commands;
 import net.dv8tion.jda.api.interactions.commands.build.OptionData;
+import net.dv8tion.jda.api.interactions.commands.build.SubcommandData;
 import net.dv8tion.jda.api.interactions.components.buttons.Button;
 import net.dv8tion.jda.api.entities.MessageEmbed;
 import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
 import net.dv8tion.jda.api.requests.GatewayIntent;
 
+import java.util.ArrayList;
 import java.util.EnumSet;
-import java.util.UUID;
+import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 
 import static net.dv8tion.jda.api.interactions.commands.OptionType.*;
@@ -29,11 +34,29 @@ public class DiscordBot extends ListenerAdapter {
 
     private final BungieClient bungie = new BungieClient();
     private final ManifestCache manifest = new ManifestCache(bungie);
+    private final Store store = new Store();
+    private final Ghost ghost = new Ghost(bungie, manifest, store);
     private BackgroundThread watcher;
 
+    /**
+     * Whether to answer {@code !name} messages as well as slash commands.
+     *
+     * <p>Off by default: reading message text needs the privileged MESSAGE_CONTENT intent,
+     * and requesting an intent that has not been enabled in the developer portal stops the
+     * bot logging in at all. Turning this on is a deliberate two-step choice.
+     */
+    private static final boolean PREFIX_COMMANDS = Config.flag("ENABLE_PREFIX_COMMANDS");
+
     public static void main(String[] args) {
-        JDA jda = JDABuilder.createLight(Config.require("DISCORD_BOT_TOKEN"), EnumSet.noneOf(GatewayIntent.class))
-                .addEventListeners(new DiscordBot())
+        DiscordBot bot = new DiscordBot();
+
+        EnumSet<GatewayIntent> intents = PREFIX_COMMANDS
+                ? EnumSet.of(GatewayIntent.GUILD_MESSAGES, GatewayIntent.MESSAGE_CONTENT,
+                             GatewayIntent.DIRECT_MESSAGES)
+                : EnumSet.noneOf(GatewayIntent.class);
+
+        JDA jda = JDABuilder.createLight(Config.require("DISCORD_BOT_TOKEN"), intents)
+                .addEventListeners(bot)
                 .build();
 
         // These commands might take a few minutes to be active after creation/update/delete
@@ -73,19 +96,64 @@ public class DiscordBot extends ListenerAdapter {
 
                 Commands.slash("watch", "Announce the weekly rotation in this channel when it changes")
                         .setGuildOnly(true)
-                        .setDefaultPermissions(DefaultMemberPermissions.enabledFor(Permission.MANAGE_CHANNEL))
+                        .setDefaultPermissions(DefaultMemberPermissions.enabledFor(Permission.MANAGE_CHANNEL)),
+
+                // ---- the ghost ----
+
+                Commands.slash("link", "Connect your Destiny account so I can manage your gear")
+                        .addOption(STRING, "code", "The code from the Bungie callback page"),
+
+                Commands.slash("unlink", "Disconnect your Destiny account"),
+
+                Commands.slash("activity", "What you're doing right now"),
+
+                Commands.slash("loadout", "Save and manage gear sets")
+                        .addSubcommands(
+                                new SubcommandData("save", "Save what you're wearing right now")
+                                        .addOption(STRING, "name", "What to call it", true),
+                                new SubcommandData("list", "Every set you've saved"),
+                                new SubcommandData("show", "What's in a set")
+                                        .addOptions(loadoutName()),
+                                new SubcommandData("delete", "Forget a set")
+                                        .addOptions(loadoutName())),
+
+                Commands.slash("equip", "Put a saved set on, or queue it until you're in orbit")
+                        .addOptions(loadoutName()),
+
+                Commands.slash("activityloadout", "Equip the set mapped to the activity you're in"),
+
+                Commands.slash("map", "Bind a set to an activity — run it while you're in there")
+                        .addOptions(loadoutName().setName("loadout")
+                                .setDescription("The set to bind").setRequired(true))
+                        .addOption(STRING, "activity", "Activity hash, if you're not in it now"),
+
+                Commands.slash("unmap", "Remove the binding for an activity")
+                        .addOption(STRING, "activity", "Activity hash, if you're not in it now"),
+
+                Commands.slash("autoequip", "Whether I act on my own between activities")
+                        .addOption(BOOLEAN, "on", "Turn it on or off", true),
+
+                Commands.slash("snapshot", "Save your current gear into an in-game loadout slot")
+                        .addOptions(new OptionData(INTEGER, "slot", "Which of the 20 slots", true)
+                                .setRequiredRange(1, 20))
         ).queue();
+
+        new GhostWatcher(jda, bot.ghost, bot.store).start();
+    }
+
+    /** A loadout-name option that completes from whatever the caller has saved. */
+    private static OptionData loadoutName() {
+        return new OptionData(STRING, "name", "Which set", true).setAutoComplete(true);
     }
 
     @Override
     public void onSlashCommandInteraction(SlashCommandInteractionEvent event)
     {
-        // Only accept commands from guilds
-        if (event.getGuild() == null)
-            return;
+        String discordId = event.getUser().getId();
         switch (event.getName())
         {
             case "ban":
+                if (guildOnly(event)) return;
                 Member member = event.getOption("user").getAsMember(); // the "user" option is required, so it doesn't need a null-check here
                 User user = event.getOption("user").getAsUser();
                 ban(event, user, member);
@@ -94,9 +162,11 @@ public class DiscordBot extends ListenerAdapter {
                 say(event, event.getOption("content").getAsString()); // content is required so no null-check here
                 break;
             case "leave":
+                if (guildOnly(event)) return;
                 leave(event);
                 break;
             case "prune": // 2 stage command with a button prompt
+                if (guildOnly(event)) return;
                 prune(event);
                 break;
             case "item":
@@ -112,7 +182,49 @@ public class DiscordBot extends ListenerAdapter {
                 destiny(event, false, () -> Destiny.profile(bungie, event.getOption("name").getAsString()));
                 break;
             case "watch":
+                if (guildOnly(event)) return;
                 watch(event);
+                break;
+            case "link":
+                OptionMapping code = event.getOption("code");
+                // Always ephemeral: the first half carries an authorisation link and the
+                // second half a single-use code, and neither belongs in a shared channel.
+                if (code == null)
+                    destiny(event, true, () -> ghost.beginLink(discordId));
+                else
+                    destiny(event, true, () -> ghost.completeLink(discordId, code.getAsString()));
+                break;
+            case "unlink":
+                destiny(event, true, () -> ghost.unlink(discordId));
+                break;
+            case "activity":
+                destiny(event, false, () -> ghost.activity(discordId));
+                break;
+            case "loadout":
+                loadout(event, discordId);
+                break;
+            case "equip":
+                // Queues when blocked — asking for a set mid-activity means you want it next.
+                destiny(event, false, () ->
+                        ghost.equipLoadout(discordId, event.getOption("name").getAsString(), true));
+                break;
+            case "activityloadout":
+                destiny(event, false, () -> ghost.activityLoadout(discordId));
+                break;
+            case "map":
+                destiny(event, false, () -> ghost.mapActivity(discordId,
+                        event.getOption("loadout").getAsString(),
+                        event.getOption("activity", null, OptionMapping::getAsString)));
+                break;
+            case "unmap":
+                destiny(event, false, () -> ghost.unmapActivity(discordId,
+                        event.getOption("activity", null, OptionMapping::getAsString)));
+                break;
+            case "autoequip":
+                destiny(event, true, () -> ghost.autoEquip(discordId, event.getOption("on").getAsBoolean()));
+                break;
+            case "snapshot":
+                destiny(event, false, () -> ghost.snapshot(discordId, event.getOption("slot").getAsInt()));
                 break;
             case "shaders":
                 event.reply("I'll shade you").setEphemeral(true).queue();
@@ -120,6 +232,105 @@ public class DiscordBot extends ListenerAdapter {
             default:
                 event.reply("I can't handle that command right now :(").setEphemeral(true).queue();
         }
+    }
+
+    private void loadout(SlashCommandInteractionEvent event, String discordId)
+    {
+        String sub = event.getSubcommandName();
+        if (sub == null)
+        {
+            event.reply("Pick a subcommand.").setEphemeral(true).queue();
+            return;
+        }
+        switch (sub)
+        {
+            case "save" -> destiny(event, false, () ->
+                    ghost.saveLoadout(discordId, event.getOption("name").getAsString()));
+            case "list" -> destiny(event, false, () -> ghost.listLoadouts(discordId));
+            case "show" -> destiny(event, false, () ->
+                    ghost.showLoadout(discordId, event.getOption("name").getAsString()));
+            case "delete" -> destiny(event, true, () ->
+                    ghost.deleteLoadout(discordId, event.getOption("name").getAsString()));
+            default -> event.reply("Unknown subcommand.").setEphemeral(true).queue();
+        }
+    }
+
+    /** Completes loadout names from the caller's own saved sets. */
+    @Override
+    public void onCommandAutoCompleteInteraction(CommandAutoCompleteInteractionEvent event)
+    {
+        if (!event.getFocusedOption().getName().equals("name")
+                && !event.getFocusedOption().getName().equals("loadout"))
+            return;
+
+        String typed = event.getFocusedOption().getValue().toLowerCase(Locale.ROOT);
+        List<Command.Choice> choices = new ArrayList<>();
+        Store.User user = store.peek(event.getUser().getId());
+        if (user == null)
+        {
+            event.replyChoices(choices).queue();
+            return;
+        }
+        for (String name : user.loadouts.keySet())
+        {
+            if (name.startsWith(typed))
+            {
+                choices.add(new Command.Choice(name, name));
+                if (choices.size() == 25) // Discord's limit
+                    break;
+            }
+        }
+        event.replyChoices(choices).queue();
+    }
+
+    /**
+     * Handles {@code !kingsfall} style shorthands when prefix commands are enabled.
+     *
+     * <p>These always queue if the game refuses, because naming a set is a statement of
+     * intent about what you are heading into rather than a comment on where you are.
+     */
+    @Override
+    public void onMessageReceived(MessageReceivedEvent event)
+    {
+        if (!PREFIX_COMMANDS || event.getAuthor().isBot())
+            return;
+
+        String content = event.getMessage().getContentRaw().trim();
+        if (!content.startsWith("!") || content.length() < 2)
+            return;
+
+        String name = content.substring(1).split("\\s+")[0].toLowerCase(Locale.ROOT);
+        String discordId = event.getAuthor().getId();
+        MessageChannel channel = event.getChannel();
+
+        Thread.ofVirtual().start(() -> {
+            try
+            {
+                MessageEmbed embed = name.equals("activityloadout")
+                        ? ghost.activityLoadout(discordId)
+                        : ghost.equipLoadout(discordId, name, true);
+                channel.sendMessageEmbeds(embed).queue();
+            }
+            catch (Exception e)
+            {
+                // Unknown names are common — someone else's bot prefix, a typo — so only
+                // answer when the problem is worth reporting.
+                Store.User owner = store.peek(discordId);
+                if ((owner == null || !owner.loadouts.containsKey(name))
+                        && !name.equals("activityloadout"))
+                    return;
+                channel.sendMessageEmbeds(Destiny.error(e.getMessage())).queue();
+            }
+        });
+    }
+
+    /** Replies and returns true when a guild-only command was used outside a guild. */
+    private boolean guildOnly(SlashCommandInteractionEvent event)
+    {
+        if (event.getGuild() != null)
+            return false;
+        event.reply("That one only works in a server.").setEphemeral(true).queue();
+        return true;
     }
 
     @Override
@@ -239,8 +450,12 @@ public class DiscordBot extends ListenerAdapter {
             }
             catch (Exception e)
             {
+                // Messages from the ghost are already written for a person to read, so they
+                // are passed through rather than wrapped in a transport-level apology.
+                String message = e.getMessage();
                 event.getHook()
-                        .sendMessageEmbeds(Destiny.error("Couldn't reach Bungie: " + e.getMessage()))
+                        .sendMessageEmbeds(Destiny.error(
+                                message == null || message.isBlank() ? "Something went wrong." : message))
                         .queue();
             }
         });
@@ -268,4 +483,3 @@ public class DiscordBot extends ListenerAdapter {
                 .queue();
     }
 }
-
