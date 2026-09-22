@@ -8,6 +8,7 @@ import net.dv8tion.jda.api.entities.channel.middleman.MessageChannel;
 import net.dv8tion.jda.api.events.interaction.command.CommandAutoCompleteInteractionEvent;
 import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent;
 import net.dv8tion.jda.api.events.interaction.component.ButtonInteractionEvent;
+import net.dv8tion.jda.api.events.interaction.component.StringSelectInteractionEvent;
 import net.dv8tion.jda.api.events.message.MessageReceivedEvent;
 import net.dv8tion.jda.api.hooks.ListenerAdapter;
 import net.dv8tion.jda.api.interactions.InteractionHook;
@@ -17,7 +18,9 @@ import net.dv8tion.jda.api.interactions.commands.OptionMapping;
 import net.dv8tion.jda.api.interactions.commands.build.Commands;
 import net.dv8tion.jda.api.interactions.commands.build.OptionData;
 import net.dv8tion.jda.api.interactions.commands.build.SubcommandData;
+import net.dv8tion.jda.api.interactions.components.ActionRow;
 import net.dv8tion.jda.api.interactions.components.buttons.Button;
+import net.dv8tion.jda.api.interactions.components.selections.StringSelectMenu;
 import net.dv8tion.jda.api.entities.MessageEmbed;
 import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
 import net.dv8tion.jda.api.requests.GatewayIntent;
@@ -137,6 +140,8 @@ public class DiscordBot extends ListenerAdapter {
 
                 Commands.slash("artifact", "Your seasonal artifact and which perks are active"),
 
+                Commands.slash("postmaster", "What's waiting in your postmaster"),
+
                 Commands.slash("snapshot", "Save your current gear into an in-game loadout slot")
                         .addOptions(new OptionData(INTEGER, "slot", "Which of the 20 slots", true)
                                 .setRequiredRange(1, 20))
@@ -248,6 +253,9 @@ public class DiscordBot extends ListenerAdapter {
             case "artifact":
                 destiny(event, false, () -> ghost.artifact(discordId));
                 break;
+            case "postmaster":
+                postmaster(event, discordId);
+                break;
             case "shaders":
                 event.reply("I'll shade you").setEphemeral(true).queue();
                 break;
@@ -306,10 +314,11 @@ public class DiscordBot extends ListenerAdapter {
     }
 
     /**
-     * Handles {@code !kingsfall} style shorthands when prefix commands are enabled.
+     * Handles {@code !equip kingsfall} style commands when prefix commands are enabled.
      *
-     * <p>These always queue if the game refuses, because naming a set is a statement of
-     * intent about what you are heading into rather than a comment on where you are.
+     * <p>Every one takes an explicit verb. Equips always queue if the game refuses, because
+     * naming a set is a statement of intent about what you are heading into rather than a
+     * comment on where you are.
      */
     @Override
     public void onMessageReceived(MessageReceivedEvent event)
@@ -323,6 +332,8 @@ public class DiscordBot extends ListenerAdapter {
 
         String[] parts = content.substring(1).split("\\s+", 2);
         String verb = parts[0].toLowerCase(Locale.ROOT);
+        if (!KNOWN_VERBS.contains(verb))
+            return;
         String argument = parts.length > 1 ? parts[1].trim() : "";
         String discordId = event.getAuthor().getId();
         MessageChannel channel = event.getChannel();
@@ -346,32 +357,156 @@ public class DiscordBot extends ListenerAdapter {
                     case "map" -> ghost.mapActivity(discordId, argument, null);
                     case "activity" -> ghost.activity(discordId);
                     case "artifact" -> ghost.artifact(discordId);
-                    // Anything else is treated as a loadout name: !kingsfall
-                    default -> ghost.equipLoadout(discordId, verb, true);
+                    case "postmaster" -> null;   // handled below, it carries a menu
+                    // No bare "!name" shorthand: every command is an explicit verb, so the
+                    // bot never has to guess whether "!roll" was meant for it or another bot.
+                    default -> null;
                 };
+                if (verb.equals("postmaster"))
+                {
+                    Ghost.PostmasterView view = ghost.postmaster(discordId);
+                    var message = channel.sendMessageEmbeds(view.embed());
+                    StringSelectMenu menu = pullMenu(discordId, view);
+                    if (menu != null)
+                        message = message.setComponents(ActionRow.of(menu));
+                    message.queue();
+                    return;
+                }
+                if (embed == null)
+                    return;
                 channel.sendMessageEmbeds(embed).queue();
             }
             catch (Exception e)
             {
-                // A bare "!something" that matches no saved set is far more likely to be
-                // another bot's prefix or a typo than a request to this one, so stay quiet
-                // unless the message was clearly aimed here.
-                if (!KNOWN_VERBS.contains(verb) && !hasLoadout(discordId, verb))
-                    return;
                 channel.sendMessageEmbeds(Destiny.error(e.getMessage())).queue();
             }
         });
     }
 
-    /** Prefix words the bot owns, so a failure is worth reporting rather than ignoring. */
+    /**
+     * The prefix words this bot answers to.
+     *
+     * <p>Anything else is ignored outright. Without an explicit list, a bare {@code !name}
+     * shorthand means guessing whether {@code !roll} was aimed here or at another bot in the
+     * channel, and guessing wrong in either direction is worse than requiring a verb.
+     */
     private static final java.util.Set<String> KNOWN_VERBS = java.util.Set.of(
             "loadout", "loadouts", "set", "save", "equip", "activityloadout", "map",
-            "activity", "artifact");
+            "activity", "artifact", "postmaster");
 
-    private boolean hasLoadout(String discordId, String name)
+    /**
+     * Answers {@code /postmaster} with the contents plus a menu to pull things back out.
+     *
+     * <p>Sent as a select rather than a row of buttons because the postmaster holds 21
+     * items, which is more than Discord's five-per-row buttons handle tidily and exactly
+     * within a select's 25-option limit.
+     */
+    private void postmaster(SlashCommandInteractionEvent event, String discordId)
     {
-        Store.User user = store.peek(discordId);
-        return user != null && user.loadouts.containsKey(name.toLowerCase(Locale.ROOT));
+        event.deferReply(false).queue();
+        Thread.ofVirtual().start(() -> {
+            try
+            {
+                Ghost.PostmasterView view = ghost.postmaster(discordId);
+                var reply = event.getHook().sendMessageEmbeds(view.embed());
+                StringSelectMenu menu = pullMenu(discordId, view);
+                if (menu != null)
+                    reply = reply.setComponents(ActionRow.of(menu));
+                reply.queue();
+            }
+            catch (Exception e)
+            {
+                String message = e.getMessage();
+                event.getHook().sendMessageEmbeds(Destiny.error(
+                        message == null || message.isBlank() ? "Something went wrong." : message)).queue();
+            }
+        });
+    }
+
+    /** Builds the pull menu, or null when there is nothing to offer. */
+    private StringSelectMenu pullMenu(String discordId, Ghost.PostmasterView view)
+    {
+        if (view.items().isEmpty())
+            return null;
+
+        StringSelectMenu.Builder menu = StringSelectMenu.create(discordId + ":pm")
+                .setPlaceholder("Pull something out");
+        for (Ghost.PostmasterItem item : view.items())
+        {
+            // Discord caps a select at 25 options; the postmaster holds 21, so this only
+            // bites if Bungie ever raises the limit.
+            if (menu.getOptions().size() == 25)
+                break;
+            String value = item.itemHash() + "|"
+                    + (item.instanceId() == null ? "-" : item.instanceId()) + "|"
+                    + item.quantity() + "|" + (item.sideEffects() ? "1" : "0");
+            menu.addOption(trim(item.label(), 100), value,
+                    item.sideEffects() ? "Pulling this may destroy something" : null);
+        }
+        return menu.build();
+    }
+
+    /** Handles a choice from the postmaster menu. */
+    @Override
+    public void onStringSelectInteraction(StringSelectInteractionEvent event)
+    {
+        String[] id = event.getComponentId().split(":");
+        if (id.length < 2 || !id[1].equals("pm"))
+            return;
+        if (!id[0].equals(event.getUser().getId()))
+        {
+            event.reply("That's not your postmaster.").setEphemeral(true).queue();
+            return;
+        }
+
+        String[] parts = event.getValues().get(0).split("\\|");
+        long itemHash = Long.parseLong(parts[0]);
+        String instanceId = parts[1].equals("-") ? null : parts[1];
+        int quantity = Integer.parseInt(parts[2]);
+        boolean sideEffects = parts[3].equals("1");
+
+        if (sideEffects)
+        {
+            // Bungie flags these as potentially destructive, so make it a deliberate choice
+            // rather than something a stray click does.
+            event.reply("Bungie flags pulling **" + names.itemName(itemHash)
+                            + "** as something that could destroy an item. Pull it anyway?")
+                    .addActionRow(
+                            Button.secondary(id[0] + ":delete", "Cancel"),
+                            Button.danger(id[0] + ":pmpull:" + itemHash + ":"
+                                    + (instanceId == null ? "-" : instanceId) + ":" + quantity,
+                                    "Pull it"))
+                    .setEphemeral(true)
+                    .queue();
+            return;
+        }
+
+        event.deferReply(false).queue();
+        pull(event.getHook(), event.getUser().getId(), itemHash, instanceId, quantity);
+    }
+
+    /** Runs a postmaster pull off the event thread and reports the outcome. */
+    private void pull(InteractionHook hook, String discordId, long itemHash,
+                      String instanceId, int quantity)
+    {
+        Thread.ofVirtual().start(() -> {
+            try
+            {
+                hook.sendMessageEmbeds(
+                        ghost.pullFromPostmaster(discordId, itemHash, instanceId, quantity)).queue();
+            }
+            catch (Exception e)
+            {
+                String message = e.getMessage();
+                hook.sendMessageEmbeds(Destiny.error(
+                        message == null || message.isBlank() ? "Something went wrong." : message)).queue();
+            }
+        });
+    }
+
+    private static String trim(String value, int limit)
+    {
+        return value.length() <= limit ? value : value.substring(0, limit - 1) + "\u2026";
     }
 
     /** Replies and returns true when a guild-only command was used outside a guild. */
@@ -406,6 +541,11 @@ public class DiscordBot extends ListenerAdapter {
                 // fallthrough delete the prompt message with our buttons
             case "delete":
                 event.getHook().deleteOriginal().queue();
+                break;
+            case "pmpull":
+                // Confirmed pull of an item Bungie flagged as destructive.
+                pull(event.getHook(), event.getUser().getId(), Long.parseLong(id[2]),
+                        id[3].equals("-") ? null : id[3], Integer.parseInt(id[4]));
         }
     }
 

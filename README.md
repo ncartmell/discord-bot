@@ -29,16 +29,28 @@ act as a ghost: link an account, see what you're playing, and put gear on.
 | `/loadout list` / `delete` | Manage saved sets |
 | `/artifact` | Your seasonal artifact and which perks are active (read-only) |
 | `/equip <name>` | Put a set on — or queue it until you're next in orbit |
-| `!kingsfall` | The same thing, if prefix commands are enabled |
-| `!loadout` / `!loadout <name>` | List sets, or print one |
-| `!set <name>` | Save what you're wearing |
-| `!equip [name]` | Equip by name, or from the activity when unnamed |
-| `!map <name>`, `!activity`, `!artifact` | The prefix forms of the above |
+| `/postmaster` | What's waiting in your postmaster, with a menu to pull items back |
 | `/map <loadout> [activity]` | Bind a set to the activity you're in, or one named outright |
 | `/unmap` | Remove that binding |
 | `/activityloadout` | Equip whatever is mapped to the activity you're in |
 | `/autoequip on\|off` | Whether the bot acts between activities |
 | `/snapshot <1-20>` | Save current gear into an in-game loadout slot |
+
+### Prefix commands
+
+Off by default — see `ENABLE_PREFIX_COMMANDS` below. Each takes an explicit verb, and
+anything else is ignored: without a fixed list, a bare `!kingsfall` shorthand would mean
+guessing whether `!roll` was aimed at this bot or another one in the channel, and guessing
+wrong in either direction is worse than typing a verb.
+
+| Command | What it does |
+| --- | --- |
+| `!loadout` / `!loadout <name>` | List sets, or print one in full |
+| `!set <name>` | Save what you're wearing |
+| `!equip <name>` | Equip it, queueing until orbit if needed |
+| `!equip` | Equip whatever is mapped to the activity you're in |
+| `!map <name>` | Bind a set to the activity you're in |
+| `!activity` / `!artifact` / `!postmaster` | As their slash equivalents |
 
 ### Moderation
 
@@ -61,8 +73,24 @@ Restoring only writes sockets whose current plug differs from the saved one, so 
 of calls is proportional to what actually changed rather than to the size of the set. It
 also means unchangeable sockets are skipped for free: one you cannot alter already matches.
 
+**The postmaster is readable and pullable.** `/postmaster` prints what is waiting, with
+quantities for stacks and power levels for gear, and warns once it is near the 21-item
+limit — the point being to see it filling up rather than to find out afterwards that the
+oldest items were dropped. Each item is offered in a select menu, and picking one pulls it
+back with `PullFromPostmaster`.
+
+Two things make that less trivial than it looks. Pulling needs a free slot in the
+destination bucket exactly as a vault transfer does, so the bot makes room first rather
+than letting the pull fail — a failed pull on a full postmaster is how items get dropped.
+And some pulls are destructive: item definitions carry
+`doesPostmasterPullHaveSideEffects`, which is set on more than you would expect (Outbreak
+Perfected and subclass items among them), so flagged items are marked ⚠ in the list and
+ask for confirmation before the bot touches them.
+
 **The artifact is read-only.** `/artifact` shows the seasonal artifact, your power bonus and
-which perks are active, but it cannot set them. There is no action endpoint for the artifact
+which perks are active, but it cannot set them. Its name comes from
+`DestinyArtifactDefinition` rather than the item table, so looking the hash up as an item
+finds nothing. There is no action endpoint for the artifact
 anywhere in the API, and its perks are progression state rather than sockets on an instanced
 item, so the plug endpoints have nothing to address. That has to be done in game.
 
@@ -115,10 +143,18 @@ It takes one plug per call and carries the same location restriction as equippin
 internals that are not player-changeable, so capturing them would only produce writes
 guaranteed to fail.
 
-**Reading needs no OAuth.** Characters, equipment, character inventories, the vault and
-the current activity are all readable with the API key alone. Only `/Destiny2/Actions/`
-acts on someone's behalf. Authenticated calls want `X-API-Key` *and* `Authorization:
-Bearer` — the bearer alone is rejected.
+**Most reading needs no OAuth, but not all of it.** Characters (200), equipment (205),
+item sockets (305), item instances (300) and both progression components come back for
+anyone with an API key. Two do not: **the vault (102) and character inventories (201)**
+answer with `privacy: 2` and no `data` at all unless the request carries the owner's token.
+
+That distinction is easy to miss, because a component with no data looks exactly like an
+empty one — an absent `characterInventories` and a genuinely empty postmaster both read as
+"no items". Since those two components are what transfers, making room and the postmaster
+all depend on, every read of a linked account goes out authenticated.
+
+Authenticated calls want `X-API-Key` *and* `Authorization: Bearer` — the bearer alone is
+rejected.
 
 **The OAuth scope is fixed at registration.** Bungie rejects a `scope` parameter in the
 authorize request; the application is granted "Move or equip Destiny gear" on its

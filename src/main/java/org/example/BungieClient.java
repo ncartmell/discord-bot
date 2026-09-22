@@ -158,8 +158,28 @@ public class BungieClient {
      * @param components component numbers, e.g. 200 for characters, 205 for equipment
      */
     JsonObject profile(int membershipType, String membershipId, String components) throws IOException {
-        return response("/Destiny2/" + membershipType + "/Profile/" + membershipId
-                + "/?components=" + components);
+        return profile(membershipType, membershipId, components, null);
+    }
+
+    /**
+     * A profile read as the linked user, which is the only way to see private components.
+     *
+     * <p>Characters, equipment and item sockets come back for anyone. The vault (102) and
+     * character inventories (201) do not: they answer with {@code privacy: 2} and no data
+     * unless the request carries the owner's token. Since those are exactly what transfers,
+     * making room and the postmaster depend on, every read of a linked account goes out
+     * authenticated.
+     */
+    JsonObject profile(int membershipType, String membershipId, String components,
+                       String accessToken) throws IOException {
+        String path = "/Destiny2/" + membershipType + "/Profile/" + membershipId
+                + "/?components=" + components;
+        JsonObject json = send("GET", path, null, accessToken);
+        if (!json.has("Response") || json.get("Response").isJsonNull()) {
+            throw new IOException("Bungie returned no data for " + path
+                    + " — the identifier is probably stale.");
+        }
+        return json.getAsJsonObject("Response");
     }
 
     // ---------------------------------------------------------------- actions (OAuth)
@@ -206,6 +226,28 @@ public class BungieClient {
         body.addProperty("membershipType", membershipType);
 
         postAs("/Destiny2/Actions/Items/TransferItem/", body.toString(), accessToken);
+    }
+
+    /**
+     * Pulls an item out of the postmaster onto the character.
+     *
+     * <p>Bungie's own wording is "with whatever implications that may entail" — some pulls
+     * are destructive, which the item definition flags as
+     * {@code doesPostmasterPullHaveSideEffects}. Instanced items need both the reference
+     * hash and the instance id; stacked ones need the hash and a stack size.
+     */
+    void pullFromPostmaster(int membershipType, String characterId, long itemHash,
+                            String instanceId, int stackSize, String accessToken) throws IOException {
+        JsonObject body = new JsonObject();
+        body.addProperty("itemReferenceHash", itemHash);
+        body.addProperty("stackSize", Math.max(1, stackSize));
+        if (instanceId != null) {
+            body.addProperty("itemId", Long.parseLong(instanceId));
+        }
+        body.addProperty("characterId", Long.parseLong(characterId));
+        body.addProperty("membershipType", membershipType);
+
+        postAs("/Destiny2/Actions/Items/PullFromPostmaster/", body.toString(), accessToken);
     }
 
     /**

@@ -48,6 +48,10 @@ final class Ghost {
     private static final String EQUIPMENT_COMPONENTS = "205,305";
     /** The subclass bucket, called out separately when printing a set. */
     private static final long SUBCLASS_BUCKET = 3284755031L;
+    /** The postmaster, which the game calls "Lost Items". 21 slots, per character. */
+    private static final long POSTMASTER_BUCKET = 215593132L;
+    /** Warn from here up, since the postmaster starts dropping things once it overflows. */
+    private static final int POSTMASTER_WARN_AT = 17;
     /** A ceiling on plug writes per equip, so a wildly stale set cannot run away. */
     private static final int MAX_PLUG_WRITES = 60;
     private static final String ACTIVITY_COMPONENTS = "200,204";
@@ -133,8 +137,8 @@ final class Ghost {
         user.refreshTokenExpiresAt = tokens.refreshExpiresAt;
 
         // Default to the character played most recently, which is almost always the one wanted.
-        JsonObject characters = child(client.profile(user.membershipType, user.membershipId, "200"),
-                "characters", "data");
+        JsonObject characters = child(client.profile(user.membershipType, user.membershipId, "200",
+                tokens.accessToken), "characters", "data");
         String chosen = null;
         String chosenPlayed = "";
         for (String characterId : characters.keySet()) {
@@ -190,7 +194,15 @@ final class Ghost {
             throw new IOException("Your Bungie authorisation has expired — run `/link` again.");
         }
 
-        OAuth.Tokens tokens = OAuth.refresh(user.refreshToken);
+        OAuth.Tokens tokens;
+        try {
+            tokens = OAuth.refresh(user.refreshToken);
+        } catch (IOException e) {
+            // Bungie's own message here is about base-64 padding and similar, which tells
+            // nobody anything useful. What matters is that the link needs redoing.
+            throw new IOException("Couldn't renew your Bungie authorisation — run `/link` again."
+                    + "\n\n_" + e.getMessage() + "_");
+        }
         user.accessToken = tokens.accessToken;
         user.accessTokenExpiresAt = tokens.accessExpiresAt;
         user.refreshToken = tokens.refreshToken;
@@ -199,12 +211,28 @@ final class Ghost {
         return user.accessToken;
     }
 
+    /**
+     * A token if one can be had, or null.
+     *
+     * <p>Used by the reads that work either way. Public components still come back without
+     * it, so a lapsed authorisation degrades those to what anyone could see rather than
+     * failing outright — which matters for the watcher, since it polls continuously.
+     */
+    private String tokenOrNull(Store.User user) {
+        try {
+            return token(user);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
     // ---------------------------------------------------------------- activity
 
     /** The activity hash the character is currently in, or 0 if they are not in one. */
     long currentActivityHash(Store.User user) throws IOException {
         JsonObject activities = child(
-                client.profile(user.membershipType, user.membershipId, ACTIVITY_COMPONENTS),
+                client.profile(user.membershipType, user.membershipId, ACTIVITY_COMPONENTS,
+                        tokenOrNull(user)),
                 "characterActivities", "data");
         if (activities == null || user.characterId == null || !activities.has(user.characterId)) {
             return 0;
@@ -247,7 +275,8 @@ final class Ghost {
             return Destiny.error("Give the loadout a name.");
         }
 
-        JsonObject profile = client.profile(user.membershipType, user.membershipId, EQUIPMENT_COMPONENTS);
+        JsonObject profile = client.profile(user.membershipType, user.membershipId,
+                EQUIPMENT_COMPONENTS, token(user));
         JsonObject equipment = child(profile, "characterEquipment", "data");
         if (equipment == null || user.characterId == null || !equipment.has(user.characterId)) {
             return Destiny.error("Couldn't read your equipment. Is the character still on the account?");
@@ -457,6 +486,154 @@ final class Ghost {
         return false;
     }
 
+    /** One thing waiting in the postmaster, in a form the interface can offer back. */
+    record PostmasterItem(long itemHash, String instanceId, int quantity, String label,
+                          boolean sideEffects) {
+    }
+
+    /** The printed postmaster plus what can be pulled out of it. */
+    record PostmasterView(MessageEmbed embed, List<PostmasterItem> items) {
+    }
+
+    /**
+     * Reads the linked character's postmaster.
+     *
+     * <p>Worth having as its own command because the postmaster holds 21 items and silently
+     * drops the oldest once it is full, so the useful thing is to see it filling up before
+     * that happens rather than afterwards.
+     */
+    PostmasterView postmaster(String discordId) throws IOException {
+        Store.User user = requireLinked(discordId);
+        // The postmaster lives in characterInventories, which is private — this needs the token.
+        JsonObject profile = client.profile(user.membershipType, user.membershipId, "200,201,300",
+                token(user));
+
+        JsonObject inventories = child(profile, "characterInventories", "data");
+        if (inventories == null || !inventories.has(user.characterId)) {
+            return new PostmasterView(Destiny.error("Couldn't read your inventory."), List.of());
+        }
+        JsonObject instances = child(profile, "itemComponents", "instances", "data");
+
+        List<PostmasterItem> waiting = new ArrayList<>();
+        List<String> lines = new ArrayList<>();
+        for (JsonElement element : inventories.getAsJsonObject(user.characterId).getAsJsonArray("items")) {
+            JsonObject item = element.getAsJsonObject();
+            if (!item.has("bucketHash") || item.get("bucketHash").getAsLong() != POSTMASTER_BUCKET) {
+                continue;
+            }
+
+            long itemHash = item.get("itemHash").getAsLong();
+            String instanceId = item.has("itemInstanceId") ? item.get("itemInstanceId").getAsString() : null;
+            int quantity = item.has("quantity") ? item.get("quantity").getAsInt() : 1;
+
+            Manifest.Item definition = manifest.item(itemHash);
+            String name = manifest.itemName(itemHash);
+            String type = definition == null ? "" : ((definition.tier() == null ? "" : definition.tier())
+                    + " " + (definition.type() == null ? "" : definition.type())).trim();
+            boolean sideEffects = definition != null && definition.pullHasSideEffects();
+
+            StringBuilder line = new StringBuilder("**" + name + "**");
+            if (!type.isEmpty()) {
+                line.append(" — ").append(type);
+            }
+            // Stacked things carry a quantity; gear carries a power level instead.
+            if (quantity > 1) {
+                line.append(" ×").append(quantity);
+            }
+            if (instanceId != null && instances != null && instances.has(instanceId)) {
+                JsonObject instance = instances.getAsJsonObject(instanceId);
+                if (instance.has("primaryStat") && instance.get("primaryStat").isJsonObject()) {
+                    JsonObject primary = instance.getAsJsonObject("primaryStat");
+                    if (primary.has("value")) {
+                        line.append(" · ").append(primary.get("value").getAsInt());
+                    }
+                }
+            }
+            if (sideEffects) {
+                line.append("  ⚠");
+            }
+            lines.add(line.toString());
+            waiting.add(new PostmasterItem(itemHash, instanceId, quantity,
+                    name + (type.isEmpty() ? "" : " — " + type), sideEffects));
+        }
+
+        int capacity = manifest.bucketCapacity(POSTMASTER_BUCKET);
+        if (capacity <= 0) {
+            capacity = 21;
+        }
+
+        if (waiting.isEmpty()) {
+            return new PostmasterView(
+                    simple("Postmaster", "Empty. Nothing waiting on this character."), List.of());
+        }
+
+        EmbedBuilder embed = new EmbedBuilder()
+                .setTitle("Postmaster")
+                .setColor(ACCENT)
+                .setDescription(waiting.size() + " of " + capacity + " slots used")
+                .addField("Waiting", join(lines), false);
+
+        if (waiting.stream().anyMatch(PostmasterItem::sideEffects)) {
+            embed.addField("⚠ marked items",
+                    "Bungie flags these as pulls that could destroy something. I'll ask again"
+                            + " before touching one.", false);
+        }
+        if (waiting.size() >= POSTMASTER_WARN_AT) {
+            embed.addField("Nearly full",
+                    "At " + capacity + " the postmaster starts dropping the oldest items."
+                            + " Clear it before your next activity.", false);
+        }
+        embed.setFooter("Pick something below to pull it out");
+        return new PostmasterView(embed.build(), waiting);
+    }
+
+    /**
+     * Pulls one item out of the postmaster.
+     *
+     * <p>The destination bucket has to have room, exactly as a vault transfer does, so this
+     * makes room first rather than letting the pull fail — a failed pull on a full postmaster
+     * is how items get dropped.
+     */
+    MessageEmbed pullFromPostmaster(String discordId, long itemHash, String instanceId,
+                                    int quantity) throws IOException {
+        Store.User user = requireLinked(discordId);
+        String accessToken = token(user);
+
+        Manifest.Item definition = manifest.item(itemHash);
+        long bucket = definition == null ? 0 : definition.bucketHash();
+        String moved = null;
+
+        if (bucket != 0) {
+            JsonObject profile = client.profile(user.membershipType, user.membershipId,
+                    INVENTORY_COMPONENTS, accessToken);
+            Map<Long, Integer> used = occupancy(profile, user.characterId);
+            if (used.getOrDefault(bucket, 0) >= capacity(bucket)) {
+                moved = makeRoom(user, profile, bucket, java.util.Set.of(), accessToken);
+                if (moved == null) {
+                    return Destiny.error("No room in your " + manifest.bucketName(bucket)
+                            + ", and nothing safe to move out. Clear a slot and try again.");
+                }
+            }
+        }
+
+        try {
+            client.pullFromPostmaster(user.membershipType, user.characterId, itemHash,
+                    instanceId, quantity, accessToken);
+        } catch (BungieClient.BungieException e) {
+            return Destiny.error("Couldn't pull " + manifest.itemName(itemHash)
+                    + " — " + reason(e.code) + ".");
+        }
+
+        EmbedBuilder embed = new EmbedBuilder()
+                .setTitle("Pulled " + manifest.itemName(itemHash))
+                .setColor(ACCENT)
+                .setDescription("It's on your character now.");
+        if (moved != null) {
+            embed.addField("Moved to the vault to make room", moved, false);
+        }
+        return embed.build();
+    }
+
     /**
      * Shows the seasonal artifact and which of its perks are switched on.
      *
@@ -467,7 +644,8 @@ final class Ghost {
      */
     MessageEmbed artifact(String discordId) throws IOException {
         Store.User user = requireLinked(discordId);
-        JsonObject profile = client.profile(user.membershipType, user.membershipId, "104,202");
+        JsonObject profile = client.profile(user.membershipType, user.membershipId, "104,202",
+                tokenOrNull(user));
 
         JsonObject seasonal = child(profile, "profileProgression", "data", "seasonalArtifact");
         JsonObject character = child(profile, "characterProgressions", "data");
@@ -485,7 +663,7 @@ final class Ghost {
                 : characterArtifact.get("artifactHash").getAsLong();
 
         EmbedBuilder embed = new EmbedBuilder()
-                .setTitle(manifest.itemName(artifactHash))
+                .setTitle(manifest.artifactName(artifactHash))
                 .setColor(ACCENT);
 
         if (seasonal != null) {
@@ -659,7 +837,8 @@ final class Ghost {
                                boolean queueIfBlocked) throws IOException {
         String accessToken = token(user);
 
-        JsonObject profile = client.profile(user.membershipType, user.membershipId, INVENTORY_COMPONENTS);
+        JsonObject profile = client.profile(user.membershipType, user.membershipId,
+                INVENTORY_COMPONENTS, accessToken);
         Map<String, String> locations = locate(profile);
 
         List<String> missing = new ArrayList<>();
@@ -870,7 +1049,7 @@ final class Ghost {
         }
 
         JsonObject equipment = child(
-                client.profile(user.membershipType, user.membershipId, "205"),
+                client.profile(user.membershipType, user.membershipId, "205", tokenOrNull(user)),
                 "characterEquipment", "data");
         if (equipment == null || user.characterId == null || !equipment.has(user.characterId)) {
             return null;
@@ -986,7 +1165,7 @@ final class Ghost {
         JsonObject socketData;
         try {
             socketData = child(client.profile(user.membershipType, user.membershipId,
-                    EQUIPMENT_COMPONENTS), "itemComponents", "sockets", "data");
+                    EQUIPMENT_COMPONENTS, accessToken), "itemComponents", "sockets", "data");
         } catch (IOException e) {
             return new PlugResult(0, List.of("couldn't read current sockets"), false);
         }

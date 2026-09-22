@@ -36,7 +36,7 @@ import java.util.zip.GZIPInputStream;
 final class Manifest {
 
     /** What gets kept for each item: enough to say "Gjallarhorn — Exotic Rocket Launcher". */
-    record Item(String name, String type, String tier, long bucketHash) {
+    record Item(String name, String type, String tier, long bucketHash, boolean pullHasSideEffects) {
 
         /** The name with its type, e.g. {@code Gjallarhorn — Exotic Rocket Launcher}. */
         String describe() {
@@ -219,6 +219,18 @@ final class Manifest {
         return exact != -1 ? exact : partial;
     }
 
+    /**
+     * The seasonal artifact's name.
+     *
+     * <p>Artifacts are in {@code DestinyArtifactDefinition}, not the item table, so looking
+     * one up as an item yields nothing. There is only ever one in play, so a single cached
+     * lookup is cheaper than preloading another table.
+     */
+    String artifactName(long hash) {
+        String name = viaFallback("DestinyArtifactDefinition", hash);
+        return name == null ? "Seasonal Artifact" : name;
+    }
+
     private String viaFallback(String table, long hash) {
         try {
             String name = fallback.displayName(table, hash);
@@ -243,6 +255,7 @@ final class Manifest {
                 String type = null;
                 String tier = null;
                 long bucket = 0;
+                boolean sideEffects = false;
 
                 reader.beginObject();
                 while (reader.hasNext()) {
@@ -259,6 +272,9 @@ final class Manifest {
                             reader.endObject();
                         }
                         case "itemTypeDisplayName" -> type = share(pool, reader.nextString());
+                        // Bungie's own warning that pulling this from the postmaster could
+                        // destroy something. Worth carrying so the bot can say so first.
+                        case "doesPostmasterPullHaveSideEffects" -> sideEffects = reader.nextBoolean();
                         case "inventory" -> {
                             reader.beginObject();
                             while (reader.hasNext()) {
@@ -277,7 +293,7 @@ final class Manifest {
                 reader.endObject();
 
                 if (name != null && !name.isBlank()) {
-                    out.put(hash, new Item(name, type, tier, bucket));
+                    out.put(hash, new Item(name, type, tier, bucket, sideEffects));
                 }
             }
             reader.endObject();
