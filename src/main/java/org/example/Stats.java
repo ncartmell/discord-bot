@@ -16,6 +16,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Historical stats: what you played, how it went, and what you killed it with.
@@ -223,6 +224,61 @@ final class Stats {
             embed.addField("By version", String.join("\n", breakdown), false);
         }
         return embed.build();
+    }
+
+    /**
+     * Total completions of a set of activity hashes, for enriching a listing.
+     *
+     * <p>Split out from {@link #clears} because the LFG board wants the number, not an
+     * embed, and wants it for someone who is not the caller.
+     *
+     * @return the total, or -1 if it could not be read — which is different from zero
+     */
+    int clearCount(Store.User user, Set<Long> activityHashes) {
+        if (activityHashes.isEmpty()) {
+            return -1;
+        }
+        try {
+            int total = 0;
+            for (String characterId : characters(user)) {
+                for (JsonElement element : client.aggregateActivityStats(user.membershipType,
+                        user.membershipId, characterId)) {
+                    JsonObject activity = element.getAsJsonObject();
+                    if (activityHashes.contains(activity.get("activityHash").getAsLong())) {
+                        total += (int) value(activity, "activityCompletions");
+                    }
+                }
+            }
+            return total;
+        } catch (IOException e) {
+            return -1;
+        }
+    }
+
+    /**
+     * The highest power level across the account's characters.
+     *
+     * @return the power, or 0 if it could not be read
+     */
+    int highestPower(Store.User user) {
+        try {
+            JsonObject profile = client.profile(user.membershipType, user.membershipId, "200");
+            JsonObject characters = profile.has("characters")
+                    ? profile.getAsJsonObject("characters").getAsJsonObject("data") : null;
+            if (characters == null) {
+                return 0;
+            }
+            int best = 0;
+            for (String characterId : characters.keySet()) {
+                JsonObject character = characters.getAsJsonObject(characterId);
+                if (character.has("light")) {
+                    best = Math.max(best, character.get("light").getAsInt());
+                }
+            }
+            return best;
+        } catch (IOException e) {
+            return 0;
+        }
     }
 
     // ---------------------------------------------------------------- weapons

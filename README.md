@@ -14,6 +14,7 @@ act as a ghost: link an account, see what you're playing, and put gear on.
 | `/item <name>` | Look up a Destiny item by name (or hash) |
 | `/weekly` | What's featured this week, with activities and time to reset |
 | `/clan` | Your clan, and this week's engram progress |
+| `/lfg <activity>` | Post a fireteam others can join, with a private voice channel |
 | `/news` | The latest articles from Bungie.net |
 | `/profile <name>` | Lifetime PvE stats for a Bungie name, e.g. `Guardian#1234` |
 | `/watch` | Announce the weekly rotation in this channel when it changes |
@@ -258,6 +259,32 @@ when neither exists.
 `fastestCompletionMsForActivity` counts any completion, so a four-minute King's Fall is a
 final-encounter run rather than a full clear. The footer says so rather than implying a
 record.
+
+**There is no way into Fireteam Finder, and the old LFG is gone.** Worth writing down,
+because the API looks like it offers both and offers neither.
+
+The in-game Fireteam Finder is live — Bungie's own `/Settings/` reports `FireteamFinder`,
+`FireteamFinderSearch` and `FireteamFinderWriteActions` all enabled — but there are no
+endpoints for it. Seven manifest tables describe its *vocabulary*: 228 labels (Chill,
+Experienced, First Time), 563 activity-graph nodes, 10 form options. You could rebuild its
+interface exactly and never see a single real fireteam.
+
+The older bungie.net LFG does have five `/Fireteam/` endpoints. They answer `ErrorCode 5
+SystemDisabled`, whose message claims maintenance; the settings flags say otherwise —
+`ClanFireteams=False`, `ScheduledFireteams=False`, `ReactFireteamUI=False`. It is retired.
+(Not an auth problem: `Destiny2/Milestones/` succeeds on the same key.)
+
+So `/lfg` is Discord's own board rather than a view onto Bungie's. What the API *does*
+contribute is the part a general-purpose LFG bot cannot manage: since members have linked
+their accounts, each name carries their real power and how many times they have cleared the
+thing being run. Those are read once on join and kept on the listing, so redrawing the post
+after a click costs nothing.
+
+If the bot has Manage Channels it also opens a private voice channel per listing — the
+everyone-role is denied both visibility and connect, and each member is granted them back as
+they join. Leaving revokes the override and disconnects them if they are sitting in it;
+closing deletes the channel. A server that has not granted the permission still gets a
+working board.
 
 **There is no rotator endpoint either.** The public milestone feed is the closest thing:
 each entry carries the activities it covers and an end date, so resolving the hashes gives

@@ -22,7 +22,11 @@ import net.dv8tion.jda.api.interactions.components.ActionRow;
 import net.dv8tion.jda.api.interactions.components.buttons.Button;
 import net.dv8tion.jda.api.interactions.components.selections.StringSelectMenu;
 import net.dv8tion.jda.api.entities.MessageEmbed;
+import net.dv8tion.jda.api.entities.Guild;
+import net.dv8tion.jda.api.entities.PermissionOverride;
+import net.dv8tion.jda.api.entities.channel.concrete.Category;
 import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
+import net.dv8tion.jda.api.entities.channel.concrete.VoiceChannel;
 import net.dv8tion.jda.api.requests.GatewayIntent;
 
 import java.util.ArrayList;
@@ -46,6 +50,7 @@ public class DiscordBot extends ListenerAdapter {
     private final World world = new World(bungie, names, store, ghost);
     private final Weekly weekly = new Weekly(bungie, names);
     private final Clan clan = new Clan(bungie, store);
+    private final Lfg lfg = new Lfg(names, store, stats);
     private BackgroundThread watcher;
 
     /**
@@ -100,6 +105,14 @@ public class DiscordBot extends ListenerAdapter {
                 Commands.slash("weekly", "What's featured this week, and when it resets"),
 
                 Commands.slash("clan", "Your clan, and this week's engram progress"),
+
+                Commands.slash("lfg", "Post a fireteam others can join")
+                        .addOption(STRING, "activity", "What you're running", true)
+                        .addOptions(new OptionData(INTEGER, "size", "How many of you (default 6)")
+                                .setRequiredRange(2, 12))
+                        .addOption(STRING, "note", "Time, requirements, anything else")
+                        .addOption(BOOLEAN, "voice", "Open a private voice channel (default true)")
+                        .setGuildOnly(true),
 
                 Commands.slash("quests", "Your quest steps, with progress on each"),
 
@@ -246,6 +259,10 @@ public class DiscordBot extends ListenerAdapter {
                 break;
             case "clan":
                 destiny(event, false, () -> clan.clan(discordId));
+                break;
+            case "lfg":
+                if (guildOnly(event)) return;
+                lfg(event, discordId);
                 break;
             case "quests":
                 destiny(event, false, () -> ghost.quests(discordId));
@@ -641,6 +658,183 @@ public class DiscordBot extends ListenerAdapter {
         return value.length() <= limit ? value : value.substring(0, limit - 1) + "\u2026";
     }
 
+    /**
+     * Posts a fireteam listing.
+     *
+     * <p>Deferred because building it reads the poster's power and clear count from Bungie,
+     * which is two calls and well past the three seconds JDA allows for an acknowledgement.
+     */
+    private void lfg(SlashCommandInteractionEvent event, String discordId)
+    {
+        event.deferReply(false).queue();
+        Guild guild = event.getGuild();
+        String memberName = event.getUser().getEffectiveName();
+        String activity = event.getOption("activity").getAsString();
+        int size = event.getOption("size", 6, OptionMapping::getAsInt);
+        String note = event.getOption("note", null, OptionMapping::getAsString);
+        boolean wantVoice = event.getOption("voice", true, OptionMapping::getAsBoolean);
+
+        Thread.ofVirtual().start(() -> {
+            Lfg.Listing listing = lfg.create(discordId, memberName, activity, size, note);
+            event.getHook()
+                    .sendMessageEmbeds(lfg.render(listing))
+                    .setComponents(lfg.controls(listing))
+                    .queue(message -> {
+                        lfg.attach(listing.id, guild.getId(), message.getChannelId(), message.getId());
+                        if (wantVoice)
+                            openVoice(guild, listing, message.getChannelId());
+                    });
+        });
+    }
+
+    /**
+     * Opens a private voice channel for a listing.
+     *
+     * <p>Private by denying the everyone-role both visibility and connect, then granting them
+     * back per member. Failure here is not fatal: the listing is the point and a server that
+     * has not given the bot Manage Channels should still get a working board, so this reports
+     * quietly rather than breaking the post.
+     */
+    private void openVoice(Guild guild, Lfg.Listing listing, String textChannelId)
+    {
+        if (!guild.getSelfMember().hasPermission(Permission.MANAGE_CHANNEL))
+        {
+            System.err.println("No Manage Channels permission in " + guild.getId()
+                    + "; skipping the voice channel.");
+            return;
+        }
+
+        // Sit it beside the channel the post went to, so it appears where people are looking.
+        Category parent = guild.getTextChannelById(textChannelId) == null ? null
+                : guild.getTextChannelById(textChannelId).getParentCategory();
+
+        var action = guild.createVoiceChannel(voiceName(listing))
+                .addPermissionOverride(guild.getPublicRole(), null,
+                        EnumSet.of(Permission.VIEW_CHANNEL, Permission.VOICE_CONNECT))
+                .addPermissionOverride(guild.getSelfMember(),
+                        EnumSet.of(Permission.VIEW_CHANNEL, Permission.VOICE_CONNECT,
+                                Permission.MANAGE_CHANNEL, Permission.MANAGE_PERMISSIONS), null);
+        if (parent != null)
+            action = action.setParent(parent);
+
+        action.queue(channel -> {
+            lfg.attachVoice(listing.id, channel.getId());
+            // Everyone already on the listing — at creation that is just the owner.
+            for (Lfg.Member member : listing.members)
+                grantVoice(guild, channel.getId(), member.discordId);
+            refresh(guild, listing);
+        }, error -> System.err.println("Could not create a voice channel: " + error.getMessage()));
+    }
+
+    private static String voiceName(Lfg.Listing listing)
+    {
+        String name = listing.activity;
+        // Discord truncates long channel names; keep it recognisable instead.
+        return (name.length() > 24 ? name.substring(0, 24) : name) + " · lfg";
+    }
+
+    private void grantVoice(Guild guild, String voiceChannelId, String discordId)
+    {
+        VoiceChannel channel = guild.getVoiceChannelById(voiceChannelId);
+        if (channel == null)
+            return;
+        guild.retrieveMemberById(discordId).queue(
+                member -> channel.upsertPermissionOverride(member)
+                        .grant(Permission.VIEW_CHANNEL, Permission.VOICE_CONNECT)
+                        .queue(null, e -> System.err.println("Voice grant failed: " + e.getMessage())),
+                e -> System.err.println("Unknown member " + discordId));
+    }
+
+    /** Removes someone's access, and disconnects them if they are sitting in there. */
+    private void revokeVoice(Guild guild, String voiceChannelId, String discordId)
+    {
+        VoiceChannel channel = guild.getVoiceChannelById(voiceChannelId);
+        if (channel == null)
+            return;
+        guild.retrieveMemberById(discordId).queue(member -> {
+            PermissionOverride override = channel.getPermissionOverride(member);
+            if (override != null)
+                override.delete().queue(null, e -> { });
+            // Leaving the listing should not leave you sitting in its voice channel.
+            if (member.getVoiceState() != null && member.getVoiceState().getChannel() != null
+                    && voiceChannelId.equals(member.getVoiceState().getChannel().getId()))
+                guild.kickVoiceMember(member).queue(null, e -> { });
+        }, e -> { });
+    }
+
+    private void closeVoice(Guild guild, Lfg.Listing listing)
+    {
+        if (listing.voiceChannelId == null)
+            return;
+        VoiceChannel channel = guild.getVoiceChannelById(listing.voiceChannelId);
+        if (channel != null)
+            channel.delete().reason("LFG listing closed").queue(null, e -> { });
+    }
+
+    /** Redraws a listing's message in place. */
+    private void refresh(Guild guild, Lfg.Listing listing)
+    {
+        if (listing.channelId == null || listing.messageId == null)
+            return;
+        TextChannel channel = guild.getTextChannelById(listing.channelId);
+        if (channel == null)
+            return;
+        channel.editMessageEmbedsById(listing.messageId, lfg.render(listing))
+                .setComponents(lfg.controls(listing))
+                .queue(null, e -> { });
+    }
+
+    /** Handles the Join, Leave and Close buttons on a listing. */
+    private void onLfgButton(ButtonInteractionEvent event)
+    {
+        String[] parts = event.getComponentId().split(":");
+        if (parts.length < 3)
+            return;
+        String id = parts[1];
+        String action = parts[2];
+        String discordId = event.getUser().getId();
+        Guild guild = event.getGuild();
+
+        Lfg.Listing listing = lfg.get(id);
+        if (listing == null || guild == null)
+        {
+            event.reply("That listing is gone.").setEphemeral(true).queue();
+            return;
+        }
+
+        // Joining reads two Bungie endpoints for the newcomer, so acknowledge first.
+        event.deferEdit().queue();
+        Thread.ofVirtual().start(() -> {
+            String problem = switch (action)
+            {
+                case "join" -> lfg.join(id, discordId, event.getUser().getEffectiveName());
+                case "leave" -> lfg.leave(id, discordId);
+                case "close" -> lfg.close(id, discordId);
+                default -> "Unknown action.";
+            };
+
+            if (problem != null)
+            {
+                event.getHook().sendMessage(problem).setEphemeral(true).queue();
+                return;
+            }
+
+            if (listing.voiceChannelId != null)
+            {
+                if (action.equals("join"))
+                    grantVoice(guild, listing.voiceChannelId, discordId);
+                else if (action.equals("leave"))
+                    revokeVoice(guild, listing.voiceChannelId, discordId);
+            }
+            if (listing.closed)
+                closeVoice(guild, listing);
+
+            event.getHook().editOriginalEmbeds(lfg.render(listing))
+                    .setComponents(lfg.controls(listing))
+                    .queue(null, e -> { });
+        });
+    }
+
     /** Replies and returns true when a guild-only command was used outside a guild. */
     private boolean guildOnly(SlashCommandInteractionEvent event)
     {
@@ -653,6 +847,14 @@ public class DiscordBot extends ListenerAdapter {
     @Override
     public void onButtonInteraction(ButtonInteractionEvent event)
     {
+        if (event.getComponentId().startsWith("lfg:"))
+        {
+            // LFG buttons are for anyone in the channel, not just whoever posted, so they
+            // are handled before the owner check below.
+            onLfgButton(event);
+            return;
+        }
+
         String[] id = event.getComponentId().split(":"); // this is the custom id we specified in our button
         String authorId = id[0];
         String type = id[1];
