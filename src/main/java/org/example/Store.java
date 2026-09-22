@@ -37,8 +37,23 @@ final class Store {
     static final class User {
         int membershipType;
         String membershipId;
-        /** The character loadouts are saved against and equipped on. */
+        /**
+         * The character commands currently act on.
+         *
+         * <p>Refreshed from the account before anything that touches gear, so it follows
+         * whoever was played most recently. {@link #pinnedCharacterId} overrides it.
+         */
         String characterId;
+
+        /**
+         * A character chosen deliberately with {@code /character}, which stops the bot
+         * following the most recent login.
+         *
+         * <p>Null means "follow whoever I played last", which is the default and what
+         * almost everyone wants. Pinning exists for the case where you are preparing one
+         * character while playing another.
+         */
+        String pinnedCharacterId;
 
         String accessToken;
         long accessTokenExpiresAt;
@@ -139,9 +154,14 @@ final class Store {
         return user;
     }
 
-    /** Returns the record for a Discord user, or null. Use when a lookup should not create one. */
+    /**
+     * Returns the record for a Discord user, or null. Use when a lookup should not create one.
+     *
+     * <p>Tolerates a null id, because some callers genuinely have no user: an announcement
+     * posted to a channel is on nobody's behalf.
+     */
     User peek(String discordId) {
-        return users.get(discordId);
+        return discordId == null ? null : users.get(discordId);
     }
 
     /** Returns only users who have completed linking — used by the auto-equip watcher. */

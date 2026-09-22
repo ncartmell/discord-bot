@@ -138,20 +138,18 @@ final class Ghost {
         user.refreshToken = tokens.refreshToken;
         user.refreshTokenExpiresAt = tokens.refreshExpiresAt;
 
-        // Default to the character played most recently, which is almost always the one wanted.
-        JsonObject characters = child(client.profile(user.membershipType, user.membershipId, "200",
-                tokens.accessToken), "characters", "data");
-        String chosen = null;
-        String chosenPlayed = "";
-        for (String characterId : characters.keySet()) {
-            JsonObject character = characters.getAsJsonObject(characterId);
-            String played = string(character, "dateLastPlayed");
-            if (chosen == null || played.compareTo(chosenPlayed) > 0) {
-                chosen = characterId;
-                chosenPlayed = played;
-            }
+        // Start on whoever was played most recently. Commands keep following that unless
+        // someone pins a character with /character, so this is a starting point rather than
+        // a decision the account is stuck with.
+        JsonObject charactersData = child(client.profile(user.membershipType, user.membershipId,
+                "200", tokens.accessToken), "characters", "data");
+        List<Characters.Character> all = Characters.of(charactersData);
+        Characters.Character chosen = Characters.active(all, null);
+        if (chosen == null) {
+            return Destiny.error("That account has no Destiny 2 characters on it.");
         }
-        user.characterId = chosen;
+        user.characterId = chosen.id();
+        user.pinnedCharacterId = null;
         store.save();
 
         String name = best.has("displayName") ? best.get("displayName").getAsString() : "your account";
@@ -159,7 +157,10 @@ final class Ghost {
                 .setTitle("Linked")
                 .setColor(ACCENT)
                 .setDescription("Connected to **" + name + "** on " + platform(user.membershipType) + ".")
-                .addField("Character", characterSummary(characters, user.characterId), false)
+                .addField("Character", chosen.className() + " · Power " + chosen.light()
+                        + "\n" + (all.size() == 1 ? "Your only character."
+                                : "Commands follow whoever you played last — `/character` to see them all."),
+                        false)
                 .addField("Next", "`/loadout save <name>` while wearing a set you want to keep.", false)
                 .build();
     }
@@ -174,6 +175,7 @@ final class Ghost {
         user.refreshToken = null;
         user.membershipId = null;
         user.characterId = null;
+        user.pinnedCharacterId = null;
         user.pendingLoadout = null;
         store.save();
         return simple("Unlinked", "Tokens removed. Your saved loadouts are still here.");
@@ -246,18 +248,228 @@ final class Ghost {
         }
     }
 
+    // ---------------------------------------------------------------- characters
+
+    /** How long a character list is reused before the account is asked again. */
+    private static final long CHARACTER_TTL_MS = 60_000;
+
+    private record CachedCharacters(List<Characters.Character> characters, long expiresAt) {
+    }
+
+    /** Membership id to its characters, so following the last login is not a call per command. */
+    private final Map<String, CachedCharacters> characterCache = new ConcurrentHashMap<>();
+
+    /** The account's characters, most recently played first, re-read at most once a minute. */
+    List<Characters.Character> characters(Store.User user) throws IOException {
+        CachedCharacters cached = characterCache.get(user.membershipId);
+        if (cached != null && cached.expiresAt() > System.currentTimeMillis()) {
+            return cached.characters();
+        }
+        List<Characters.Character> fresh = Characters.of(child(
+                client.profile(user.membershipType, user.membershipId, "200", tokenOrNull(user)),
+                "characters", "data"));
+        // An empty result means the read failed or privacy hid it, not that the account has
+        // no characters. Caching that would keep every gear command broken for a minute.
+        if (!fresh.isEmpty()) {
+            characterCache.put(user.membershipId,
+                    new CachedCharacters(fresh, System.currentTimeMillis() + CHARACTER_TTL_MS));
+        }
+        return fresh;
+    }
+
+    /**
+     * Points the user record at the character a command should act on, and returns its id.
+     *
+     * <p>Called at the top of everything character-scoped. It writes {@code user.characterId}
+     * rather than threading an id through twenty call sites, which keeps the change to the
+     * existing gear code to a single line each — the private helpers below still read the
+     * field, they just now read a field that is correct.
+     *
+     * <p>A pin short-circuits the lookup entirely, so choosing a character deliberately also
+     * costs one fewer request than following the last login.
+     */
+    String activeCharacter(Store.User user) throws IOException {
+        if (user.pinnedCharacterId != null) {
+            return settle(user, user.pinnedCharacterId);
+        }
+        Characters.Character active = Characters.active(characters(user), null);
+        if (active == null) {
+            throw new IOException("Couldn't read your characters — Bungie may be down.");
+        }
+        return settle(user, active.id());
+    }
+
+    /**
+     * The same decision, when the caller already has the {@code characters} component.
+     *
+     * <p>Several commands ask for component 200 anyway, so resolving from what they have
+     * avoids a second round trip for data already in hand.
+     */
+    String activeCharacter(Store.User user, JsonObject charactersData) {
+        if (user.pinnedCharacterId != null) {
+            return settle(user, user.pinnedCharacterId);
+        }
+        Characters.Character active = Characters.active(Characters.of(charactersData), null);
+        // Falling back to whatever was last used beats failing: the caller is mid-command
+        // and the stored id is still a real character.
+        return active == null ? user.characterId : settle(user, active.id());
+    }
+
+    private String settle(Store.User user, String characterId) {
+        if (!characterId.equals(user.characterId)) {
+            user.characterId = characterId;
+            store.save();
+        }
+        return characterId;
+    }
+
+    /**
+     * Lists the account's characters, saying which one commands are pointed at and why.
+     *
+     * @param wanted a class name to pin, {@code auto} to stop pinning, or null to just look
+     */
+    MessageEmbed character(String discordId, String wanted) throws IOException {
+        Store.User user = requireLinked(discordId);
+        List<Characters.Character> all = characters(user);
+        if (all.isEmpty()) {
+            return Destiny.error("Couldn't read your characters — Bungie may be down.");
+        }
+
+        String note = null;
+        if (wanted != null && !wanted.isBlank()) {
+            if (wanted.trim().equalsIgnoreCase("auto")) {
+                user.pinnedCharacterId = null;
+                store.save();
+                note = "Following whoever you played most recently again.";
+            } else {
+                Characters.Character pick = Characters.byClassName(all, wanted);
+                if (pick == null) {
+                    return Destiny.error("No " + wanted + " on this account. You have "
+                            + String.join(", ", all.stream().map(Characters.Character::className).toList())
+                            + ".");
+                }
+                user.pinnedCharacterId = pick.id();
+                store.save();
+                note = "Pinned to your " + pick.className() + ". `/character auto` to undo.";
+            }
+        }
+
+        Characters.Character active = Characters.active(all, user.pinnedCharacterId);
+        settle(user, active.id());
+
+        List<String> lines = new ArrayList<>();
+        for (Characters.Character character : all) {
+            boolean current = character.id().equals(active.id());
+            String title = character.titleRecordHash() == 0 ? null
+                    : manifest.title(character.titleRecordHash());
+            lines.add((current ? "**▸ " : " ") + character.className()
+                    + (current ? "**" : "")
+                    + " · Power " + character.light()
+                    + (title == null ? "" : " · *" + title + "*")
+                    + "\n  last played " + ago(character.lastPlayed()));
+        }
+
+        EmbedBuilder embed = new EmbedBuilder()
+                .setTitle("Your characters")
+                .setColor(ACCENT)
+                .setDescription(String.join("\n", lines));
+        if (note != null) {
+            embed.addField("Changed", note, false);
+        }
+        if (active.emblemPath() != null) {
+            embed.setThumbnail("https://www.bungie.net" + active.emblemPath());
+        }
+        return embed.setFooter(user.pinnedCharacterId == null
+                ? "Commands follow whoever you played last \u00b7 /character <class> to pin one"
+                : "Pinned \u00b7 /character auto to follow your last login again").build();
+    }
+
+    /**
+     * How full the vault is.
+     *
+     * <p>The count is already computed internally — equipping has to know whether there is
+     * room before it pushes anything out of a full bucket — so this is the same read given a
+     * face. Capacity comes from the bucket definition rather than a hardcoded 1300, since
+     * Bungie has raised it before.
+     */
+    MessageEmbed vault(String discordId) throws IOException {
+        Store.User user = requireLinked(discordId);
+        JsonObject inventory = child(client.profile(user.membershipType, user.membershipId,
+                "102", token(user)), "profileInventory", "data");
+        if (inventory == null || !inventory.has("items")) {
+            return Destiny.error("Couldn't read your vault. It needs a working authorisation —"
+                    + " try `/link` again.");
+        }
+
+        int used = 0;
+        Map<String, Integer> byTier = new LinkedHashMap<>();
+        for (JsonElement element : inventory.getAsJsonArray("items")) {
+            JsonObject item = element.getAsJsonObject();
+            if (!item.has("bucketHash") || item.get("bucketHash").getAsLong() != VAULT_BUCKET) {
+                continue;
+            }
+            used++;
+            Manifest.Item definition = item.has("itemHash")
+                    ? manifest.item(item.get("itemHash").getAsLong()) : null;
+            String tier = definition == null || definition.tier() == null || definition.tier().isBlank()
+                    ? "Other" : definition.tier();
+            byTier.merge(tier, 1, Integer::sum);
+        }
+
+        int capacity = manifest.bucketCapacity(VAULT_BUCKET);
+        int free = capacity == 0 ? -1 : capacity - used;
+
+        EmbedBuilder embed = new EmbedBuilder()
+                .setTitle("Vault")
+                .setColor(free >= 0 && free <= 20 ? new Color(0xE8A33D) : ACCENT)
+                .setDescription("**" + used + "**"
+                        + (capacity == 0 ? "" : " / " + capacity) + " slots used"
+                        + (free < 0 ? "" : " · **" + free + "** free"));
+
+        if (!byTier.isEmpty()) {
+            List<String> lines = new ArrayList<>();
+            byTier.entrySet().stream()
+                    .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+                    .forEach(entry -> lines.add(entry.getKey() + " — " + entry.getValue()));
+            embed.addField("By rarity", String.join("\n", lines), false);
+        }
+        if (free >= 0 && free <= 20) {
+            embed.setFooter("Nearly full — transfers into the vault start failing at zero");
+        }
+        return embed.build();
+    }
+
+    /** A rough "3 hours ago" for a timestamp. */
+    private static String ago(java.time.Instant when) {
+        if (when == null || when.equals(java.time.Instant.EPOCH)) {
+            return "never";
+        }
+        java.time.Duration since = java.time.Duration.between(when, java.time.Instant.now());
+        long days = since.toDays();
+        if (days > 0) {
+            return days == 1 ? "yesterday" : days + " days ago";
+        }
+        long hours = since.toHours();
+        if (hours > 0) {
+            return hours + (hours == 1 ? " hour ago" : " hours ago");
+        }
+        long minutes = Math.max(1, since.toMinutes());
+        return minutes + (minutes == 1 ? " minute ago" : " minutes ago");
+    }
+
     // ---------------------------------------------------------------- activity
 
     /** The activity hash the character is currently in, or 0 if they are not in one. */
     long currentActivityHash(Store.User user) throws IOException {
-        JsonObject activities = child(
-                client.profile(user.membershipType, user.membershipId, ACTIVITY_COMPONENTS,
-                        tokenOrNull(user)),
-                "characterActivities", "data");
-        if (activities == null || user.characterId == null || !activities.has(user.characterId)) {
+        JsonObject profile = client.profile(user.membershipType, user.membershipId,
+                ACTIVITY_COMPONENTS, tokenOrNull(user));
+        // The components already include 200, so the active character costs nothing here.
+        String characterId = activeCharacter(user, child(profile, "characters", "data"));
+        JsonObject activities = child(profile, "characterActivities", "data");
+        if (activities == null || characterId == null || !activities.has(characterId)) {
             return 0;
         }
-        JsonObject mine = activities.getAsJsonObject(user.characterId);
+        JsonObject mine = activities.getAsJsonObject(characterId);
         return mine.has("currentActivityHash") ? mine.get("currentActivityHash").getAsLong() : 0;
     }
 
@@ -290,6 +502,7 @@ final class Ghost {
     /** Saves whatever the character is wearing right now, by item instance id. */
     MessageEmbed saveLoadout(String discordId, String rawName) throws IOException {
         Store.User user = requireLinked(discordId);
+        activeCharacter(user);
         String name = normalise(rawName);
         if (name.isEmpty()) {
             return Destiny.error("Give the loadout a name.");
@@ -530,6 +743,7 @@ final class Ghost {
 
     private MessageEmbed pursuits(String discordId, boolean wantBounties) throws IOException {
         Store.User user = requireLinked(discordId);
+        activeCharacter(user);
         JsonObject profile = client.profile(user.membershipType, user.membershipId, "201,301",
                 token(user));
 
@@ -708,6 +922,7 @@ final class Ghost {
      */
     MessageEmbed lockSet(String discordId, String rawName, boolean locked) throws IOException {
         Store.User user = requireLinked(discordId);
+        activeCharacter(user);
         String name = normalise(rawName);
         List<Store.Item> items = user.loadouts.get(name);
         if (items == null) {
@@ -766,6 +981,7 @@ final class Ghost {
         // The postmaster lives in characterInventories, which is private — this needs the token.
         JsonObject profile = client.profile(user.membershipType, user.membershipId, "200,201,300",
                 token(user));
+        activeCharacter(user, child(profile, "characters", "data"));
 
         JsonObject inventories = child(profile, "characterInventories", "data");
         if (inventories == null || !inventories.has(user.characterId)) {
@@ -856,6 +1072,7 @@ final class Ghost {
     MessageEmbed pullFromPostmaster(String discordId, long itemHash, String instanceId,
                                     int quantity) throws IOException {
         Store.User user = requireLinked(discordId);
+        activeCharacter(user);
         String accessToken = token(user);
 
         Manifest.Item definition = manifest.item(itemHash);
@@ -903,6 +1120,7 @@ final class Ghost {
      */
     MessageEmbed artifact(String discordId) throws IOException {
         Store.User user = requireLinked(discordId);
+        activeCharacter(user);
         JsonObject profile = client.profile(user.membershipType, user.membershipId, "104,202",
                 tokenOrNull(user));
 
@@ -1098,6 +1316,7 @@ final class Ghost {
 
         JsonObject profile = client.profile(user.membershipType, user.membershipId,
                 INVENTORY_COMPONENTS, accessToken);
+        activeCharacter(user, child(profile, "characters", "data"));
         Map<String, String> locations = locate(profile);
 
         List<String> missing = new ArrayList<>();
@@ -1285,6 +1504,7 @@ final class Ghost {
         if (slot < 1 || slot > 20) {
             return Destiny.error("Loadout slots run 1 to 20.");
         }
+        activeCharacter(user);
         client.snapshotLoadout(user.membershipType, user.characterId, slot - 1, token(user));
         return simple("Snapshotted to slot " + slot,
                 "Your current gear is now in that in-game loadout slot."
@@ -1307,9 +1527,10 @@ final class Ghost {
             return null;
         }
 
-        JsonObject equipment = child(
-                client.profile(user.membershipType, user.membershipId, "205", tokenOrNull(user)),
-                "characterEquipment", "data");
+        JsonObject profile = client.profile(user.membershipType, user.membershipId, "200,205",
+                tokenOrNull(user));
+        activeCharacter(user, child(profile, "characters", "data"));
+        JsonObject equipment = child(profile, "characterEquipment", "data");
         if (equipment == null || user.characterId == null || !equipment.has(user.characterId)) {
             return null;
         }
@@ -1603,15 +1824,6 @@ final class Ghost {
 
     private Store.User requireLinked(String discordId) throws IOException {
         return store.requireLinked(discordId);
-    }
-
-    private static String characterSummary(JsonObject characters, String characterId) {
-        if (characters == null || characterId == null || !characters.has(characterId)) {
-            return "unknown";
-        }
-        JsonObject character = characters.getAsJsonObject(characterId);
-        String light = character.has("light") ? character.get("light").getAsString() : "?";
-        return "Power " + light + " · `" + characterId + "`";
     }
 
     private static String platform(int membershipType) {

@@ -1,38 +1,42 @@
 package org.example;
 
-import net.dv8tion.jda.api.EmbedBuilder;
-import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
-
-import java.awt.Color;
 import java.time.Duration;
-import java.util.List;
-import java.util.Set;
-import java.util.TreeSet;
+import java.time.Instant;
 
 /**
- * Watches the public milestones and announces the weekly rotation when it changes.
+ * Announces the daily and weekly resets.
  *
- * <p>Milestones turn over at the weekly reset, so this polls on a long interval and only
- * posts when the set of active milestones actually differs from the last one it saw. A
- * restart mid-week therefore does not re-announce, and a reset produces one message.
+ * <p>Destiny resets at 17:00 UTC: every day for vendor bounties and the lost sector
+ * rotation, and additionally on Tuesday for the whole week's content. That schedule is
+ * fixed and has been for years, so this watches the clock rather than trying to infer a
+ * reset from the data — which was the previous approach, and which could not tell a reset
+ * apart from Bungie editing the milestone feed mid-week.
+ *
+ * <p>Announcements wait a few minutes past the boundary. The public milestone feed does not
+ * update the instant the reset lands, so posting at 17:00:00 exactly would sometimes
+ * describe the week that just ended.
+ *
+ * <p>The first pass records where in the schedule the bot started without posting, so a
+ * restart on Wednesday afternoon does not announce Tuesday's reset.
  */
 public class BackgroundThread extends Thread {
 
-    private static final Duration POLL_INTERVAL = Duration.ofMinutes(30);
+    private static final Duration POLL_INTERVAL = Duration.ofMinutes(5);
 
-    private final TextChannel channel;
-    private final BungieClient client;
-    private final ManifestCache manifest;
+    /** How long after a reset to wait before believing what Bungie reports. */
+    private static final Duration SETTLE = Duration.ofMinutes(10);
 
-    /** Null until the first successful poll, so startup does not look like a change. */
-    private Set<String> lastSeen = null;
+    private final Announcer announcer;
+    private final Weekly weekly;
 
-    BackgroundThread(TextChannel channel, BungieClient client, ManifestCache manifest) {
-        super("milestone-watcher");
+    /** The reset most recently accounted for. Null until the first pass sets a baseline. */
+    private Instant lastSeen = null;
+
+    BackgroundThread(Announcer announcer, Weekly weekly) {
+        super("reset-watcher");
         setDaemon(true);
-        this.channel = channel;
-        this.client = client;
-        this.manifest = manifest;
+        this.announcer = announcer;
+        this.weekly = weekly;
     }
 
     @Override
@@ -41,9 +45,9 @@ public class BackgroundThread extends Thread {
             try {
                 poll();
             } catch (Exception e) {
-                // A failed poll is not worth stopping for — Bungie has weekly maintenance
-                // windows, and the next attempt will pick any change up.
-                System.err.println("Milestone poll failed: " + e.getMessage());
+                // Bungie takes the API down for maintenance around the weekly reset, which
+                // is exactly when this runs. The next pass picks it up.
+                System.err.println("Reset announcement failed: " + e.getMessage());
             }
 
             try {
@@ -56,31 +60,25 @@ public class BackgroundThread extends Thread {
     }
 
     private void poll() throws Exception {
-        List<String> names = Milestones.activeMilestoneNames(client, manifest);
-        if (names.isEmpty()) {
-            return;
-        }
+        Instant now = Instant.now();
+        Instant reset = Reset.last(now);
 
-        Set<String> current = new TreeSet<>(names);
-        if (current.equals(lastSeen)) {
+        // Inside the settling window the feed may still describe the previous period, so
+        // treat the reset as not having happened yet rather than announcing stale content.
+        if (now.isBefore(reset.plus(SETTLE))) {
             return;
         }
 
         boolean firstRun = lastSeen == null;
-        lastSeen = current;
-        if (firstRun) {
-            // Record the starting state without announcing it.
+        if (firstRun || !reset.isAfter(lastSeen)) {
+            lastSeen = reset;
             return;
         }
+        lastSeen = reset;
 
-        String body = names.stream().map(name -> "• " + name).reduce((a, b) -> a + "\n" + b).orElse("");
-
-        EmbedBuilder embed = new EmbedBuilder()
-                .setTitle("Weekly reset")
-                .setColor(new Color(0x00A8E1))
-                .setDescription(body)
-                .setFooter("Milestones now active");
-
-        channel.sendMessageEmbeds(embed.build()).queue();
+        if (!announcer.isWatching()) {
+            return;
+        }
+        announcer.send(Reset.isWeekly(reset) ? weekly.rotators() : weekly.daily());
     }
 }

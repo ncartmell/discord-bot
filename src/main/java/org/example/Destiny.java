@@ -8,7 +8,6 @@ import net.dv8tion.jda.api.entities.MessageEmbed;
 
 import java.awt.Color;
 import java.io.IOException;
-import java.util.List;
 
 /**
  * Builds the Discord embeds for the Destiny commands.
@@ -81,27 +80,6 @@ final class Destiny {
         return embed.build();
     }
 
-    // ---------------------------------------------------------------- /weekly
-
-    static MessageEmbed weekly(BungieClient client, ManifestCache manifest) throws IOException {
-        List<String> names = Milestones.activeMilestoneNames(client, manifest);
-        if (names.isEmpty()) {
-            return new EmbedBuilder()
-                    .setTitle("No active milestones")
-                    .setColor(Color.GRAY)
-                    .setDescription("Bungie returned nothing — this usually means maintenance.")
-                    .build();
-        }
-
-        String body = String.join("\n", names.stream().map(name -> "• " + name).toList());
-        return new EmbedBuilder()
-                .setTitle("This week")
-                .setColor(ACCENT)
-                .setDescription(body)
-                .setFooter(names.size() + " active milestones")
-                .build();
-    }
-
     // ---------------------------------------------------------------- /news
 
     static MessageEmbed news(BungieClient client) throws IOException {
@@ -134,31 +112,57 @@ final class Destiny {
 
     // ---------------------------------------------------------------- /profile
 
-    static MessageEmbed profile(BungieClient client, String bungieName) throws IOException {
-        int hash = bungieName.lastIndexOf('#');
+    /**
+     * Turns a Bungie name into the Destiny account behind it.
+     *
+     * <p>Shared with the stats commands, which take an optional player to look up. The
+     * failures — a name in the wrong shape, or one nobody has — are both things a person
+     * typed, so they come back as messages rather than stack traces.
+     *
+     * @throws IOException with a message meant for the person who asked
+     */
+    static JsonObject resolveAccount(BungieClient client, String bungieName) throws IOException {
+        int hash = bungieName == null ? -1 : bungieName.lastIndexOf('#');
         if (hash < 1 || hash == bungieName.length() - 1) {
-            return error("That does not look like a Bungie name. They are written as `Guardian#1234`.");
+            throw new IOException("`" + bungieName + "` doesn't look like a Bungie name."
+                    + " They're written as `Guardian#1234`.");
         }
 
-        String name = bungieName.substring(0, hash);
         int code;
         try {
             code = Integer.parseInt(bungieName.substring(hash + 1).trim());
         } catch (NumberFormatException e) {
-            return error("The part after `#` should be four digits, for example `Guardian#1234`.");
+            throw new IOException("The part after `#` should be digits, e.g. `Guardian#1234`.");
         }
 
-        JsonArray matches = client.searchPlayer(name, code);
+        JsonArray matches = client.searchPlayer(bungieName.substring(0, hash), code);
         if (matches.isEmpty()) {
-            return error("No Destiny account found for `" + bungieName + "`.");
+            throw new IOException("No Destiny account found for `" + bungieName + "`.");
+        }
+        return matches.get(0).getAsJsonObject();
+    }
+
+    /** A Bungie name as the API spells it, e.g. {@code Guardian#1234}. */
+    static String accountName(JsonObject account) {
+        String name = string(account, "bungieGlobalDisplayName", "Unknown");
+        return account.has("bungieGlobalDisplayNameCode")
+                ? name + "#" + String.format("%04d", account.get("bungieGlobalDisplayNameCode").getAsInt())
+                : name;
+    }
+
+    static MessageEmbed profile(BungieClient client, String bungieName) throws IOException {
+        JsonObject account;
+        try {
+            account = resolveAccount(client, bungieName);
+        } catch (IOException e) {
+            return error(e.getMessage());
         }
 
-        JsonObject account = matches.get(0).getAsJsonObject();
         int membershipType = account.get("membershipType").getAsInt();
         String membershipId = account.get("membershipId").getAsString();
-        String displayName = string(account, "bungieGlobalDisplayName", name);
+        String displayName = string(account, "bungieGlobalDisplayName", bungieName);
         int displayCode = account.has("bungieGlobalDisplayNameCode")
-                ? account.get("bungieGlobalDisplayNameCode").getAsInt() : code;
+                ? account.get("bungieGlobalDisplayNameCode").getAsInt() : 0;
 
         EmbedBuilder embed = new EmbedBuilder()
                 .setColor(ACCENT)

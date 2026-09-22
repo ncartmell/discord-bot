@@ -35,14 +35,59 @@ final class Weekly {
         this.manifest = manifest;
     }
 
+    /** One milestone from the public feed, resolved into names. */
+    private record Entry(String name, List<String> activities, Instant ends, int order) {
+    }
+
     MessageEmbed rotators() throws IOException {
-        JsonObject milestones = client.publicMilestones();
-
-        record Entry(String name, List<String> activities, Instant ends, int order) {
+        List<Entry> entries = entries();
+        Instant reset = soonest(entries);
+        if (entries.isEmpty()) {
+            return new EmbedBuilder()
+                    .setTitle("No active milestones")
+                    .setColor(Color.GRAY)
+                    .setDescription("Bungie returned nothing — this usually means maintenance.")
+                    .build();
         }
-        List<Entry> entries = new ArrayList<>();
-        Instant reset = null;
 
+        entries.sort(Comparator.comparingInt(Entry::order));
+
+        // Things with an activity attached are the featured content; the rest are chores.
+        List<String> featured = new ArrayList<>();
+        List<String> other = new ArrayList<>();
+        for (Entry entry : entries) {
+            if (entry.activities().isEmpty()) {
+                other.add("• " + entry.name());
+            } else {
+                featured.add("**" + entry.name() + "**\n   " + String.join(", ", entry.activities()));
+            }
+        }
+
+        EmbedBuilder embed = new EmbedBuilder()
+                .setTitle("This week")
+                .setColor(ACCENT)
+                .setDescription(reset == null ? entries.size() + " active milestones"
+                        : "Resets in " + until(reset));
+
+        if (!featured.isEmpty()) {
+            embed.addField("Featured (" + featured.size() + ")", join(featured), false);
+        }
+        if (!other.isEmpty()) {
+            embed.addField("Also active", join(other), false);
+        }
+        return embed.build();
+    }
+
+
+    /**
+     * The public milestone feed, resolved into names and end dates.
+     *
+     * <p>Shared by the weekly rotator listing and the daily announcement, which want the
+     * same parse filtered two different ways.
+     */
+    private List<Entry> entries() throws IOException {
+        JsonObject milestones = client.publicMilestones();
+        List<Entry> entries = new ArrayList<>();
         for (Map.Entry<String, JsonElement> milestone : milestones.entrySet()) {
             JsonObject value = milestone.getValue().getAsJsonObject();
             if (!value.has("milestoneHash")) {
@@ -78,46 +123,62 @@ final class Weekly {
                     ends = null;
                 }
             }
-            if (ends != null && (reset == null || ends.isBefore(reset))) {
-                reset = ends;
-            }
-
-            entries.add(new Entry(name, activities,
-                    ends, value.has("order") ? value.get("order").getAsInt() : 0));
+            entries.add(new Entry(name, activities, ends,
+                    value.has("order") ? value.get("order").getAsInt() : 0));
         }
+        return entries;
+    }
 
-        if (entries.isEmpty()) {
-            return new EmbedBuilder()
-                    .setTitle("No active milestones")
-                    .setColor(Color.GRAY)
-                    .setDescription("Bungie returned nothing — this usually means maintenance.")
-                    .build();
-        }
-
-        entries.sort(Comparator.comparingInt(Entry::order));
-
-        // Things with an activity attached are the featured content; the rest are chores.
-        List<String> featured = new ArrayList<>();
-        List<String> other = new ArrayList<>();
+    /** The nearest end date across the feed, which is the next reset. */
+    private static Instant soonest(List<Entry> entries) {
+        Instant soonest = null;
         for (Entry entry : entries) {
-            if (entry.activities().isEmpty()) {
-                other.add("• " + entry.name());
-            } else {
-                featured.add("**" + entry.name() + "**\n   " + String.join(", ", entry.activities()));
+            if (entry.ends() != null && (soonest == null || entry.ends().isBefore(soonest))) {
+                soonest = entry.ends();
             }
+        }
+        return soonest;
+    }
+
+    /**
+     * The daily announcement: what expires in the next day, and how long the week has left.
+     *
+     * <p>Deliberately modest about what it claims. Daily reset mostly refreshes vendor
+     * bounties and the lost sector rotation, and neither of those is exposed as a public
+     * component — there is no endpoint that says "today's legend lost sector is X". What
+     * the feed does give is end dates, so anything expiring within the day is genuinely
+     * daily and everything else is correctly left to the weekly post.
+     */
+    MessageEmbed daily() throws IOException {
+        Instant now = Instant.now();
+        Instant weeklyReset = Reset.nextWeekly(now);
+        // A day either side of the next daily reset, which is long enough to catch things
+        // that expire today whether this runs just before or just after the boundary.
+        Instant cutoff = now.plus(Duration.ofHours(26));
+
+        List<String> expiring = new ArrayList<>();
+        for (Entry entry : entries()) {
+            if (entry.ends() == null || !entry.ends().isBefore(cutoff)) {
+                continue;
+            }
+            // On Monday the weekly reset is inside the 26-hour window, which would sweep
+            // every raid and weekly chore into a post about today. Anything that lives
+            // until the week turns over belongs to the weekly announcement, not this one.
+            if (!entry.ends().isBefore(weeklyReset)) {
+                continue;
+            }
+            expiring.add("\u2022 **" + entry.name() + "**"
+                    + (entry.activities().isEmpty() ? ""
+                       : " \u2014 " + String.join(", ", entry.activities())));
         }
 
         EmbedBuilder embed = new EmbedBuilder()
-                .setTitle("This week")
+                .setTitle("Daily reset")
                 .setColor(ACCENT)
-                .setDescription(reset == null ? entries.size() + " active milestones"
-                        : "Resets in " + until(reset));
-
-        if (!featured.isEmpty()) {
-            embed.addField("Featured (" + featured.size() + ")", join(featured), false);
-        }
-        if (!other.isEmpty()) {
-            embed.addField("Also active", join(other), false);
+                .setDescription("Vendor bounties and the lost sector rotation have refreshed."
+                        + "\n\nThe week resets in " + until(weeklyReset) + ".");
+        if (!expiring.isEmpty()) {
+            embed.addField("Gone tomorrow (" + expiring.size() + ")", join(expiring), false);
         }
         return embed.build();
     }

@@ -2,8 +2,6 @@ package org.example;
 import net.dv8tion.jda.api.JDA;
 import net.dv8tion.jda.api.JDABuilder;
 import net.dv8tion.jda.api.Permission;
-import net.dv8tion.jda.api.entities.Member;
-import net.dv8tion.jda.api.entities.User;
 import net.dv8tion.jda.api.entities.channel.middleman.MessageChannel;
 import net.dv8tion.jda.api.events.interaction.command.CommandAutoCompleteInteractionEvent;
 import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent;
@@ -33,7 +31,6 @@ import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.concurrent.TimeUnit;
 
 import static net.dv8tion.jda.api.interactions.commands.OptionType.*;
 
@@ -45,13 +42,23 @@ public class DiscordBot extends ListenerAdapter {
     private final Manifest names = new Manifest(bungie, manifest);
     private final Store store = new Store();
     private final Ghost ghost = new Ghost(bungie, names, store);
+    private final Collection collection = new Collection(bungie, ghost);
     private final Stats stats = new Stats(bungie, names, store);
-    private final Vendors vendors = new Vendors(bungie, names, store, ghost);
+    private final Vendors vendors = new Vendors(bungie, names, store, ghost, collection);
     private final World world = new World(bungie, names, store, ghost);
     private final Weekly weekly = new Weekly(bungie, names);
+    private final Progress progress = new Progress(bungie, names, manifest, store, ghost);
+    private final Seals seals = new Seals(bungie, names, store, ghost);
     private final Clan clan = new Clan(bungie, store);
     private final Lfg lfg = new Lfg(names, store, stats);
-    private BackgroundThread watcher;
+
+    /**
+     * Where the reset and Xûr announcements go.
+     *
+     * <p>Not final because it needs the JDA instance, which does not exist until the bot
+     * has connected.
+     */
+    private Announcer announcer;
 
     /**
      * Whether to answer {@code !name} messages as well as slash commands.
@@ -76,29 +83,6 @@ public class DiscordBot extends ListenerAdapter {
 
         // These commands might take a few minutes to be active after creation/update/delete
         jda.updateCommands().addCommands(
-                Commands.slash("ban", "Ban a user from this server. Requires permission to ban users.")
-                        .addOptions(new OptionData(USER, "user", "The user to ban") // USER type allows to include members of the server or other users by id
-                                .setRequired(true)) // This command requires a parameter
-                        .addOptions(new OptionData(INTEGER, "del_days", "Delete messages from the past days.") // This is optional
-                                .setRequiredRange(0, 7)) // Only allow values between 0 and 7 (inclusive)
-                        .addOptions(new OptionData(STRING, "reason", "The ban reason to use (default: Banned by <user>)")) // optional reason
-                        .setGuildOnly(true) // This way the command can only be executed from a guild, and not the DMs
-                        .setDefaultPermissions(DefaultMemberPermissions.enabledFor(Permission.BAN_MEMBERS)), // Only members with the BAN_MEMBERS permission are going to see this command
-
-                // Simple reply commands
-                Commands.slash("say", "Makes the bot say what you tell it to")
-                        .addOption(STRING, "content", "What the bot should say", true), // you can add required options like this too
-
-                // Commands without any inputs
-                Commands.slash("leave", "Make the bot leave the server")
-                        .setGuildOnly(true) // this doesn't make sense in DMs
-                        .setDefaultPermissions(DefaultMemberPermissions.DISABLED), // only admins should be able to use this command.
-
-                Commands.slash("prune", "Prune messages from this channel")
-                        .addOption(INTEGER, "amount", "How many messages to prune (Default 100)") // simple optional argument
-                        .setGuildOnly(true)
-                        .setDefaultPermissions(DefaultMemberPermissions.enabledFor(Permission.MESSAGE_MANAGE)),
-
                 Commands.slash("item", "Look up a Destiny item by its manifest hash")
                         .addOption(STRING, "name", "Item name, or a hash from a light.gg or Armory URL", true),
 
@@ -121,7 +105,11 @@ public class DiscordBot extends ListenerAdapter {
                 Commands.slash("profile", "Look up a player's lifetime PvE stats")
                         .addOption(STRING, "name", "Bungie name, e.g. Guardian#1234", true),
 
-                Commands.slash("watch", "Announce the weekly rotation in this channel when it changes")
+                Commands.slash("watch", "Announce the weekly reset and Xûr's arrival in this channel")
+                        .setGuildOnly(true)
+                        .setDefaultPermissions(DefaultMemberPermissions.enabledFor(Permission.MANAGE_CHANNEL)),
+
+                Commands.slash("unwatch", "Stop announcing in this server")
                         .setGuildOnly(true)
                         .setDefaultPermissions(DefaultMemberPermissions.enabledFor(Permission.MANAGE_CHANNEL)),
 
@@ -133,6 +121,21 @@ public class DiscordBot extends ListenerAdapter {
                 Commands.slash("unlink", "Disconnect your Destiny account"),
 
                 Commands.slash("activity", "What you're doing right now"),
+
+                Commands.slash("character", "Your characters, and which one I'm acting on")
+                        .addOptions(new OptionData(STRING, "class", "Pin one, or go back to automatic")
+                                .addChoice("Titan", "Titan")
+                                .addChoice("Hunter", "Hunter")
+                                .addChoice("Warlock", "Warlock")
+                                .addChoice("Follow my last login", "auto")),
+
+                Commands.slash("ranks", "Your reputation ranks and season pass"),
+
+                Commands.slash("checklist", "What's still outstanding this week"),
+
+                Commands.slash("vault", "How full your vault is"),
+
+                Commands.slash("seals", "The titles you've earned"),
 
                 Commands.slash("loadout", "Save and manage gear sets")
                         .addSubcommands(
@@ -169,22 +172,27 @@ public class DiscordBot extends ListenerAdapter {
                 Commands.slash("vendor", "What a vendor is selling you")
                         .addOption(STRING, "name", "Vendor name, e.g. Banshee-44", true),
 
-                Commands.slash("recent", "Your last few activities")
+                Commands.slash("recent", "The last few activities played")
                         .addOptions(new OptionData(INTEGER, "count", "How many to show")
-                                .setRequiredRange(1, 15)),
+                                .setRequiredRange(1, 15))
+                        .addOptions(player()),
 
                 Commands.slash("pgcr", "The full breakdown of an activity")
-                        .addOption(STRING, "instance", "Instance id — defaults to your last activity"),
+                        .addOption(STRING, "instance", "Instance id — defaults to the last activity")
+                        .addOptions(player()),
 
-                Commands.slash("clears", "How many times you've completed an activity")
-                        .addOption(STRING, "activity", "Activity name, e.g. Vault of Glass", true),
+                Commands.slash("clears", "How many times an activity has been completed")
+                        .addOption(STRING, "activity", "Activity name, e.g. Vault of Glass", true)
+                        .addOptions(player()),
 
-                Commands.slash("weapon", "Your kills with one weapon")
-                        .addOption(STRING, "name", "Weapon name", true),
+                Commands.slash("weapon", "Kills with one weapon")
+                        .addOption(STRING, "name", "Weapon name", true)
+                        .addOptions(player()),
 
-                Commands.slash("topweapons", "Your most used weapons")
+                Commands.slash("topweapons", "The most used weapons on an account")
                         .addOptions(new OptionData(INTEGER, "count", "How many to show")
-                                .setRequiredRange(1, 20)),
+                                .setRequiredRange(1, 20))
+                        .addOptions(player()),
 
                 Commands.slash("destination", "What's available on a destination")
                         .addOption(STRING, "name", "e.g. The Moon — omit for the list"),
@@ -208,6 +216,11 @@ public class DiscordBot extends ListenerAdapter {
         // Downloads in the background; commands work meanwhile via per-hash lookups.
         bot.names.loadInBackground();
 
+        // The announcement watchers poll from startup and post to whichever channels have
+        // opted in, so /watch is a registration rather than something that starts a thread.
+        bot.announcer = new Announcer(jda);
+        new BackgroundThread(bot.announcer, bot.weekly).start();
+        new XurWatcher(bot.bungie, bot.vendors, bot.announcer).start();
         new GhostWatcher(jda, bot.ghost, bot.store).start();
     }
 
@@ -216,29 +229,23 @@ public class DiscordBot extends ListenerAdapter {
         return new OptionData(STRING, "name", "Which set", true).setAutoComplete(true);
     }
 
+    /**
+     * The optional "someone else" option on the stats commands.
+     *
+     * <p>Called {@code player} rather than {@code name} so it cannot be confused with the
+     * loadout and item options that already use that word — including by the autocomplete
+     * handler, which keys off the option name.
+     */
+    private static OptionData player() {
+        return new OptionData(STRING, "player", "Bungie name, e.g. Guardian#1234 — defaults to you");
+    }
+
     @Override
     public void onSlashCommandInteraction(SlashCommandInteractionEvent event)
     {
         String discordId = event.getUser().getId();
         switch (event.getName())
         {
-            case "ban":
-                if (guildOnly(event)) return;
-                Member member = event.getOption("user").getAsMember(); // the "user" option is required, so it doesn't need a null-check here
-                User user = event.getOption("user").getAsUser();
-                ban(event, user, member);
-                break;
-            case "say":
-                say(event, event.getOption("content").getAsString()); // content is required so no null-check here
-                break;
-            case "leave":
-                if (guildOnly(event)) return;
-                leave(event);
-                break;
-            case "prune": // 2 stage command with a button prompt
-                if (guildOnly(event)) return;
-                prune(event);
-                break;
             case "item":
                 destiny(event, false, () -> {
                     String query = event.getOption("name").getAsString().trim();
@@ -277,6 +284,13 @@ public class DiscordBot extends ListenerAdapter {
                 if (guildOnly(event)) return;
                 watch(event);
                 break;
+            case "unwatch":
+                if (guildOnly(event)) return;
+                event.reply(announcer != null && announcer.unwatch(event.getGuild().getId())
+                                ? "Stopped announcing here."
+                                : "I wasn't announcing in this server.")
+                        .setEphemeral(true).queue();
+                break;
             case "link":
                 OptionMapping code = event.getOption("code");
                 // Always ephemeral: the first half carries an authorisation link and the
@@ -291,6 +305,22 @@ public class DiscordBot extends ListenerAdapter {
                 break;
             case "activity":
                 destiny(event, false, () -> ghost.activity(discordId));
+                break;
+            case "character":
+                destiny(event, false, () -> ghost.character(discordId,
+                        event.getOption("class", null, OptionMapping::getAsString)));
+                break;
+            case "ranks":
+                destiny(event, false, () -> progress.ranks(discordId));
+                break;
+            case "checklist":
+                destiny(event, false, () -> progress.checklist(discordId));
+                break;
+            case "vault":
+                destiny(event, false, () -> ghost.vault(discordId));
+                break;
+            case "seals":
+                destiny(event, false, () -> seals.seals(discordId));
                 break;
             case "loadout":
                 loadout(event, discordId);
@@ -325,31 +355,31 @@ public class DiscordBot extends ListenerAdapter {
                 postmaster(event, discordId);
                 break;
             case "xur":
-                destiny(event, false, vendors::xur);
+                destiny(event, false, () -> vendors.xur(discordId));
                 break;
             case "vendor":
                 destiny(event, false, () ->
                         vendors.vendor(discordId, event.getOption("name").getAsString()));
                 break;
             case "recent":
-                destiny(event, false, () ->
-                        stats.recent(discordId, event.getOption("count", 5, OptionMapping::getAsInt)));
+                destiny(event, false, () -> stats.recent(discordId, player(event),
+                        event.getOption("count", 5, OptionMapping::getAsInt)));
                 break;
             case "pgcr":
-                destiny(event, false, () -> stats.pgcr(discordId,
+                destiny(event, false, () -> stats.pgcr(discordId, player(event),
                         event.getOption("instance", null, OptionMapping::getAsString)));
                 break;
             case "clears":
-                destiny(event, false, () ->
-                        stats.clears(discordId, event.getOption("activity").getAsString()));
+                destiny(event, false, () -> stats.clears(discordId, player(event),
+                        event.getOption("activity").getAsString()));
                 break;
             case "weapon":
-                destiny(event, false, () ->
-                        stats.weapon(discordId, event.getOption("name").getAsString()));
+                destiny(event, false, () -> stats.weapon(discordId, player(event),
+                        event.getOption("name").getAsString()));
                 break;
             case "topweapons":
-                destiny(event, false, () ->
-                        stats.topWeapons(discordId, event.getOption("count", 10, OptionMapping::getAsInt)));
+                destiny(event, false, () -> stats.topWeapons(discordId, player(event),
+                        event.getOption("count", 10, OptionMapping::getAsInt)));
                 break;
             case "destination":
                 destiny(event, false, () -> world.destination(discordId,
@@ -369,12 +399,15 @@ public class DiscordBot extends ListenerAdapter {
                         event.getOption("set").getAsString(),
                         event.getOption("locked", true, OptionMapping::getAsBoolean)));
                 break;
-            case "shaders":
-                event.reply("I'll shade you").setEphemeral(true).queue();
-                break;
             default:
                 event.reply("I can't handle that command right now :(").setEphemeral(true).queue();
         }
+    }
+
+    /** The Bungie name someone asked about, or null when they meant themselves. */
+    private static String player(SlashCommandInteractionEvent event)
+    {
+        return event.getOption("player", null, OptionMapping::getAsString);
     }
 
     private void loadout(SlashCommandInteractionEvent event, String discordId)
@@ -475,13 +508,15 @@ public class DiscordBot extends ListenerAdapter {
                     case "activity" -> ghost.activity(discordId);
                     case "artifact" -> ghost.artifact(discordId);
                     case "postmaster" -> null;   // handled below, it carries a menu
-                    case "xur" -> vendors.xur();
+                    case "xur" -> vendors.xur(discordId);
                     case "vendor" -> vendors.vendor(discordId, argument);
-                    case "recent" -> stats.recent(discordId, number(argument, 5, 15));
-                    case "pgcr" -> stats.pgcr(discordId, argument.isEmpty() ? null : argument);
-                    case "clears" -> stats.clears(discordId, argument);
-                    case "weapon" -> stats.weapon(discordId, argument);
-                    case "topweapons" -> stats.topWeapons(discordId, number(argument, 10, 20));
+                    // The prefix forms are always about the caller; looking someone else up
+                    // is a slash-command option, where it can be named and described.
+                    case "recent" -> stats.recent(discordId, null, number(argument, 5, 15));
+                    case "pgcr" -> stats.pgcr(discordId, null, argument.isEmpty() ? null : argument);
+                    case "clears" -> stats.clears(discordId, null, argument);
+                    case "weapon" -> stats.weapon(discordId, null, argument);
+                    case "topweapons" -> stats.topWeapons(discordId, null, number(argument, 10, 20));
                     case "destination", "destinations" -> world.destination(discordId, argument);
                     case "bounties" -> ghost.bounties(discordId);
                     case "quests" -> ghost.quests(discordId);
@@ -489,6 +524,12 @@ public class DiscordBot extends ListenerAdapter {
                     case "weekly", "rotators" -> weekly.rotators();
                     case "fireteam" -> ghost.fireteam(discordId);
                     case "currencies" -> ghost.currencies(discordId);
+                    case "character", "characters" -> ghost.character(discordId,
+                            argument.isEmpty() ? null : argument);
+                    case "ranks" -> progress.ranks(discordId);
+                    case "checklist", "todo" -> progress.checklist(discordId);
+                    case "vault" -> ghost.vault(discordId);
+                    case "seals", "titles" -> seals.seals(discordId);
                     case "lock" -> ghost.lockSet(discordId, argument, true);
                     case "unlock" -> ghost.lockSet(discordId, argument, false);
                     // No bare "!name" shorthand: every command is an explicit verb, so the
@@ -528,7 +569,8 @@ public class DiscordBot extends ListenerAdapter {
             "activity", "artifact", "postmaster", "xur", "vendor", "recent", "pgcr",
             "clears", "weapon", "topweapons", "bounties", "fireteam", "currencies",
             "lock", "unlock", "destination", "destinations", "quests", "clan",
-            "weekly", "rotators");
+            "weekly", "rotators", "character", "characters", "ranks", "checklist",
+            "todo", "vault", "seals", "titles");
 
     /** Parses a count from a prefix argument, falling back when it is missing or nonsense. */
     private static int number(String argument, int fallback, int limit)
@@ -863,17 +905,10 @@ public class DiscordBot extends ListenerAdapter {
             return;
         event.deferEdit().queue(); // acknowledge the button was clicked, otherwise the interaction will fail
 
-        MessageChannel channel = event.getChannel();
         switch (type)
         {
-            case "prune":
-                int amount = Integer.parseInt(id[2]);
-                event.getChannel().getIterableHistory()
-                        .skipTo(event.getMessageIdLong())
-                        .takeAsync(amount)
-                        .thenAccept(channel::purgeMessages);
-                // fallthrough delete the prompt message with our buttons
             case "delete":
+                // The cancel half of the postmaster's "this might destroy something" prompt.
                 event.getHook().deleteOriginal().queue();
                 break;
             case "pmpull":
@@ -881,74 +916,6 @@ public class DiscordBot extends ListenerAdapter {
                 pull(event.getHook(), event.getUser().getId(), Long.parseLong(id[2]),
                         id[3].equals("-") ? null : id[3], Integer.parseInt(id[4]));
         }
-    }
-
-    public void ban(SlashCommandInteractionEvent event, User user, Member member)
-    {
-        event.deferReply(true).queue(); // Let the user know we received the command before doing anything else
-        InteractionHook hook = event.getHook(); // This is a special webhook that allows you to send messages without having permissions in the channel and also allows ephemeral messages
-        hook.setEphemeral(true); // All messages here will now be ephemeral implicitly
-        if (!event.getMember().hasPermission(Permission.BAN_MEMBERS))
-        {
-            hook.sendMessage("You do not have the required permissions to ban users from this server.").queue();
-            return;
-        }
-
-        Member selfMember = event.getGuild().getSelfMember();
-        if (!selfMember.hasPermission(Permission.BAN_MEMBERS))
-        {
-            hook.sendMessage("I don't have the required permissions to ban users from this server.").queue();
-            return;
-        }
-
-        if (member != null && !selfMember.canInteract(member))
-        {
-            hook.sendMessage("This user is too powerful for me to ban.").queue();
-            return;
-        }
-
-        // optional command argument, fall back to 0 if not provided
-        int delDays = event.getOption("del_days", 0, OptionMapping::getAsInt); // this last part is a method reference used to "resolve" the option value
-
-        // optional ban reason with a lazy evaluated fallback (supplier)
-        String reason = event.getOption("reason",
-                () -> "Banned by " + event.getUser().getName(), // used if getOption("reason") is null (not provided)
-                OptionMapping::getAsString); // used if getOption("reason") is not null (provided)
-
-        // Ban the user and send a success response
-        event.getGuild().ban(user, delDays, TimeUnit.DAYS)
-                .reason(reason) // audit-log ban reason (sets X-AuditLog-Reason header)
-                .flatMap(v -> hook.sendMessage("Banned user " + user.getName())) // chain a followup message after the ban is executed
-                .queue(); // execute the entire call chain
-    }
-
-    public void say(SlashCommandInteractionEvent event, String content)
-    {
-        event.reply(content).queue(); // This requires no permissions!
-    }
-
-    public void leave(SlashCommandInteractionEvent event)
-    {
-        if (!event.getMember().hasPermission(Permission.KICK_MEMBERS))
-            event.reply("You do not have permissions to kick me.").setEphemeral(true).queue();
-        else
-            event.reply("Leaving the server... :wave:") // Yep we received it
-                    .flatMap(v -> event.getGuild().leave()) // Leave server after acknowledging the command
-                    .queue();
-    }
-
-    public void prune(SlashCommandInteractionEvent event)
-    {
-        OptionMapping amountOption = event.getOption("amount"); // This is configured to be optional so check for null
-        int amount = amountOption == null
-                ? 100 // default 100
-                : (int) Math.min(200, Math.max(2, amountOption.getAsLong())); // enforcement: must be between 2-200
-        String userId = event.getUser().getId();
-        event.reply("This will delete " + amount + " messages.\nAre you sure?") // prompt the user with a button menu
-                .addActionRow(// this means "<style>(<id>, <label>)", you can encode anything you want in the id (up to 100 characters)
-                        Button.secondary(userId + ":delete", "Nevermind!"),
-                        Button.danger(userId + ":prune:" + amount, "Yes!")) // the first parameter is the component id we use in onButtonInteraction above
-                .queue();
     }
 
     /** Something that builds an embed and may fail talking to Bungie. */
@@ -985,7 +952,13 @@ public class DiscordBot extends ListenerAdapter {
         });
     }
 
-    /** Starts the milestone watcher in the channel the command was used in. */
+    /**
+     * Points this server's announcements at the channel the command was used in.
+     *
+     * <p>Registration only — the watchers themselves run from startup. One channel per
+     * server, so running this somewhere else moves the announcements rather than adding a
+     * second copy.
+     */
     private void watch(SlashCommandInteractionEvent event)
     {
         if (!event.getChannel().getType().isMessage() || event.getChannelType().isThread())
@@ -993,16 +966,15 @@ public class DiscordBot extends ListenerAdapter {
             event.reply("Use this in a normal text channel.").setEphemeral(true).queue();
             return;
         }
-
-        TextChannel channel = event.getChannel().asTextChannel();
-        if (watcher != null && watcher.isAlive())
+        if (announcer == null)
         {
-            watcher.interrupt();
+            event.reply("Still starting up — try again in a moment.").setEphemeral(true).queue();
+            return;
         }
 
-        watcher = new BackgroundThread(channel, bungie, manifest);
-        watcher.start();
-        event.reply("Watching for the weekly reset. I'll post here when the rotation changes.")
+        announcer.watch(event.getGuild().getId(), event.getChannel().getId());
+        event.reply("Announcing here: the weekly reset, and when Xûr arrives."
+                        + "\n\n`/unwatch` to stop.")
                 .setEphemeral(true)
                 .queue();
     }

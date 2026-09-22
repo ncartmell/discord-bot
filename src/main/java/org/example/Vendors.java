@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * What vendors are selling.
@@ -33,16 +34,24 @@ final class Vendors {
     private final Manifest manifest;
     private final Store store;
     private final Ghost ghost;
+    private final Collection collection;
 
-    Vendors(BungieClient client, Manifest manifest, Store store, Ghost ghost) {
+    Vendors(BungieClient client, Manifest manifest, Store store, Ghost ghost, Collection collection) {
         this.client = client;
         this.manifest = manifest;
         this.store = store;
         this.ghost = ghost;
+        this.collection = collection;
     }
 
-    /** Xûr's stock. Needs no account and no token. */
-    MessageEmbed xur() throws IOException {
+    /**
+     * Xûr's stock, marked up with what the caller does not own yet.
+     *
+     * <p>The stock itself needs no account and no token. The ownership marks do, so they are
+     * added when a linked account is available and quietly left off when it is not — "is Xûr
+     * worth the trip" is a better answer with them and still an answer without.
+     */
+    MessageEmbed xur(String discordId) throws IOException {
         JsonObject response = client.publicVendors("400,402");
         JsonObject sales = child(response, "sales", "data");
         JsonObject block = sales == null || !sales.has(String.valueOf(XUR)) ? null
@@ -56,7 +65,8 @@ final class Vendors {
                     .build();
         }
 
-        Map<String, List<String>> grouped = group(block.getAsJsonObject("saleItems"));
+        Set<Long> owned = collection.acquired(store.peek(discordId));
+        Map<String, List<String>> grouped = group(block.getAsJsonObject("saleItems"), owned);
         if (grouped.isEmpty()) {
             return new EmbedBuilder()
                     .setTitle("Xûr")
@@ -72,7 +82,10 @@ final class Vendors {
         for (Map.Entry<String, List<String>> entry : grouped.entrySet()) {
             embed.addField(entry.getKey(), join(entry.getValue()), false);
         }
-        return embed.setFooter("Stock is the same for everyone").build();
+        return embed.setFooter(owned == null
+                ? "Stock is the same for everyone \u00b7 /link to see what you're missing"
+                : "Stock is the same for everyone \u00b7 NEW means it's not in your Collections")
+                .build();
     }
 
     /** Any other vendor, which needs the linked account because stock is per-character. */
@@ -89,11 +102,13 @@ final class Vendors {
         }
 
         JsonObject response = client.characterVendors(user.membershipType, user.membershipId,
-                user.characterId, "400,402", ghost.accessToken(user));
+                ghost.activeCharacter(user), "400,402", ghost.accessToken(user));
         JsonObject sales = child(response, "sales", "data");
         if (sales == null) {
             return Destiny.error("Bungie returned no vendor stock.");
         }
+
+        Set<Long> owned = collection.acquired(user);
 
         // Several hashes can share a name; take whichever one is actually available today.
         for (Long hash : matches) {
@@ -102,7 +117,7 @@ final class Vendors {
                 continue;
             }
             Map<String, List<String>> grouped = group(sales.getAsJsonObject(key)
-                    .getAsJsonObject("saleItems"));
+                    .getAsJsonObject("saleItems"), owned);
             if (grouped.isEmpty()) {
                 continue;
             }
@@ -113,7 +128,8 @@ final class Vendors {
             for (Map.Entry<String, List<String>> entry : grouped.entrySet()) {
                 embed.addField(entry.getKey(), join(entry.getValue()), false);
             }
-            return embed.setFooter("Your stock — vendor inventories differ per character").build();
+            return embed.setFooter("Your stock \u2014 vendor inventories differ per character"
+                    + (owned == null ? "" : " \u00b7 NEW means it's not in your Collections")).build();
         }
 
         return Destiny.error("**" + String.join(", ", manifest.vendorNamesMatching(query))
@@ -121,8 +137,12 @@ final class Vendors {
                 + "\n\nSome vendors only appear in certain seasons or destinations.");
     }
 
-    /** Groups a vendor's stock by item type, exotics first, dropping the unnameable. */
-    private Map<String, List<String>> group(JsonObject saleItems) {
+    /**
+     * Groups a vendor's stock by item type, exotics first, dropping the unnameable.
+     *
+     * @param owned collectible hashes the caller already has, or null to skip the marks
+     */
+    private Map<String, List<String>> group(JsonObject saleItems, Set<Long> owned) {
         Map<String, List<String>> exotic = new LinkedHashMap<>();
         Map<String, List<String>> rest = new LinkedHashMap<>();
         if (saleItems == null) {
@@ -148,9 +168,14 @@ final class Vendors {
 
             boolean isExotic = "Exotic".equalsIgnoreCase(item.tier());
             String cost = cost(sale);
+            // Only items that are in Collections have a collectible hash, so anything
+            // without one gets no mark rather than a guess.
+            boolean missing = owned != null && item.collectibleHash() != 0
+                    && !owned.contains(item.collectibleHash());
             (isExotic ? exotic : rest)
                     .computeIfAbsent(isExotic ? "Exotics" : type, k -> new ArrayList<>())
-                    .add("**" + item.name() + "** — " + type + (cost.isEmpty() ? "" : " · " + cost));
+                    .add("**" + item.name() + "** — " + type + (cost.isEmpty() ? "" : " · " + cost)
+                            + (missing ? " · **NEW**" : ""));
         }
 
         exotic.putAll(rest);

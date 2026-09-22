@@ -17,13 +17,17 @@ act as a ghost: link an account, see what you're playing, and put gear on.
 | `/lfg <activity>` | Post a fireteam others can join, with a private voice channel |
 | `/news` | The latest articles from Bungie.net |
 | `/profile <name>` | Lifetime PvE stats for a Bungie name, e.g. `Guardian#1234` |
-| `/watch` | Announce the weekly rotation in this channel when it changes |
-| `/xur` | What Xûr is selling, with prices |
-| `/recent [count]` | Your last few activities, newest first |
-| `/pgcr [instance]` | Full breakdown of an activity — everyone's kills, deaths, assists |
-| `/clears <activity>` | Completions and fastest time, across all characters |
-| `/weapon <name>` | Kills and precision kills with one weapon |
-| `/topweapons [count]` | Your most used weapons |
+| `/watch` / `/unwatch` | Announce the daily and weekly resets, and Xûr's arrival, in this channel |
+| `/xur` | What Xûr is selling, with prices — and what you don't own yet |
+| `/recent [count] [player]` | The last few activities, newest first |
+| `/pgcr [instance] [player]` | Full breakdown of an activity — everyone's kills, deaths, assists |
+| `/clears <activity> [player]` | Completions and fastest time, across all characters |
+| `/weapon <name> [player]` | Kills and precision kills with one weapon |
+| `/topweapons [count] [player]` | The most used weapons on an account |
+
+The stats commands all take an optional `player` — a Bungie name like `Guardian#1234` —
+and default to your own linked account. None of them need OAuth: they read with the API
+key alone, for any account whose privacy settings allow it.
 
 ### Your account — needs OAuth
 
@@ -32,6 +36,11 @@ act as a ghost: link an account, see what you're playing, and put gear on.
 | `/link` | Start the Bungie authorisation, then `/link code:<code>` to finish |
 | `/unlink` | Remove the stored tokens. Saved loadouts are kept |
 | `/activity` | What you're in right now, and whether a set is mapped to it |
+| `/character [class]` | Your characters, and which one commands act on. Pin one, or go back to automatic |
+| `/ranks` | Reputation ranks and the season pass |
+| `/checklist` | What's still outstanding this week — completed milestones are hidden |
+| `/vault` | How full the vault is, broken down by rarity |
+| `/seals` | The titles you've earned, as medals |
 | `/loadout save <name>` | Store what you're wearing: items, perks, mods, subclass config |
 | `/loadout show <name>` | Print the set in full — every item, type and plug |
 | `/loadout list` / `delete` | Manage saved sets |
@@ -70,11 +79,11 @@ wrong in either direction is worse than typing a verb.
 | `!recent`, `!pgcr`, `!clears`, `!weapon`, `!topweapons` | Stats |
 | `!bounties`, `!quests`, `!fireteam`, `!currencies` | Account |
 | `!destination <name>`, `!weekly`, `!clan` | World |
+| `!character`, `!ranks`, `!checklist`, `!vault`, `!seals` | Account |
 | `!lock <set>` / `!unlock <set>` | Lock or unlock a saved set |
 
-### Moderation
-
-`/ban`, `/say`, `/leave`, `/prune`.
+The prefix forms are always about the caller — looking someone else up is a slash-command
+option, where it can be named and described rather than guessed from a bare argument.
 
 ## What a set covers
 
@@ -113,6 +122,90 @@ which perks are active, but it cannot set them. Its name comes from
 finds nothing. There is no action endpoint for the artifact
 anywhere in the API, and its perks are progression state rather than sockets on an instanced
 item, so the plug endpoints have nothing to address. That has to be done in game.
+
+## Which character the bot is talking about
+
+Every gear action in the API is character-scoped — equipping, transfers, the postmaster,
+vendor stock, the artifact and the milestone list all take a character id. The bot used to
+hold one, picked when the account was linked, which quietly made half its answers about the
+wrong guardian as soon as someone switched class.
+
+It now follows **whoever was played most recently**, which is what `dateLastPlayed` is for
+and is almost always the character meant. `/character` shows all three and lets you pin one
+when it is not — preparing a Titan while playing a Hunter, say — and `/character auto` goes
+back to following the last login.
+
+The resolution is cached for a minute per account, so following the last login costs at most
+one extra request a minute rather than one per command, and several commands get it free:
+`/postmaster`, `/equip`, `/destination`, `/ranks` and `/checklist` all request component 200
+anyway, so the character is read out of a response they were already fetching. Pinning skips
+the lookup entirely.
+
+## Ranks, seals and collections
+
+**Ranks are found by icon, not by hash.** A character carries 86 progressions, most of them
+internal counters. The ones a player would call a rank — Vanguard, Crucible, Gambit, Trials,
+Competitive Division and Strange Favor — are exactly the ones whose
+`DestinyProgressionDefinition` has a `rankIcon`, so that flag is the filter. A hardcoded list
+of hashes would need revisiting every season; this does not.
+
+**The season pass is walked to, not hardcoded.** Which progression it is changes every
+season, so `/ranks` goes profile → `currentSeasonHash` → `DestinySeasonDefinition` →
+`seasonPassHash` → `DestinySeasonPassDefinition` → `rewardProgressionHash` and
+`prestigeProgressionHash`. Three cached definition lookups, and it never goes stale.
+
+**A seal is not a definition type.** It is a `DestinyPresentationNodeDefinition` with a
+`completionRecordHash`, where that record awards a title. Intersecting those two conditions
+finds all 84 of them without a list that needs updating each expansion. Completion is
+component 900, and records live in two places — account-wide under `profileRecords` and
+per-character under `characterRecords` — so both are merged before anything is decided.
+
+Seals are counted **by title rather than by node**: gilding is a separate presentation node
+pointing at the same title, so Conqueror alone is four nodes. Counting nodes would report an
+account as further off than it is. Gilding itself is not shown, because the API records it
+separately from the seal and inferring it would be guesswork.
+
+**Collections are a cross-reference, not a command.** A list of several thousand
+collectibles is not something anyone wants in an embed; the useful question is narrower —
+when Xûr is selling an exotic, have you got it already. So component 800 is read only to mark
+vendor stock, via `collectibleHash` on the item definition, which `Manifest` keeps for
+exactly this. 12,197 of 36,687 items have one; anything without is not in Collections at all,
+so nothing is claimed about it either way.
+
+The distinction between "owns nothing" and "could not read it" matters here and is kept: the
+lookup returns null rather than an empty set on failure, because confusing the two would tell
+someone every exotic Xûr has is new to them.
+
+## Announcements
+
+`/watch` registers a channel; the watchers themselves run from startup and post to whoever
+has opted in. Previously each `/watch` started its own thread and the bot held a single
+channel between them, so a second server took the announcements away from the first —
+a bug that only appears once the bot is somewhere other than the server it was built in.
+
+**Resets are read off the clock, not the data.** Destiny resets at 17:00 UTC daily, and
+additionally on Tuesday for the week. The previous approach inferred a reset from the set of
+active milestones changing, which cannot tell a reset apart from Bungie editing the feed
+mid-week. Announcements wait ten minutes past the boundary, because the public feed does not
+update the instant the reset lands and posting at 17:00:00 exactly would sometimes describe
+the week that just ended.
+
+The daily post is deliberately modest about what it claims. Daily reset mostly refreshes
+vendor bounties and the lost sector rotation, and neither is exposed as a public component —
+there is no endpoint that says "today's legend lost sector is X". What the feed does give is
+end dates, so anything expiring within the day is genuinely daily.
+
+With one correction that only shows up on a Monday: the weekly reset falls inside a
+twenty-six hour window, so a naive "expires soon" filter sweeps every raid and weekly chore
+into a post about today. Anything living until the week turns over is therefore excluded and
+left to the weekly announcement. On the eve of reset the daily post is correctly near-empty
+rather than a duplicate of the weekly one.
+
+**Xûr is watched for, not scheduled.** He arrives Friday and leaves at Tuesday's reset, but
+rather than encode that — Bungie has moved it before, and it would be wrong during an outage
+anyway — the watcher polls the public vendor feed and treats him appearing as the event. Both
+watchers record a baseline on their first pass, so restarting on a Saturday does not announce
+an arrival that happened yesterday.
 
 ## The two constraints that shape all of this
 
@@ -216,9 +309,15 @@ was out of reach. It is not: the names alone are under a megabyte. `Manifest` st
 download and keeps only the fields that get displayed, discarding each entry's remaining
 hundred-odd properties as it goes.
 
-Measured on a cold start: **1.4 seconds, about 10 MB retained**, for 36,687 items and 3,744
-activities. It loads on a background thread, so commands work immediately and fall back to
-single-hash HTTP lookups until it arrives.
+Eleven tables are read this way. The three added for ranks and seals are the same trick
+applied harder: `DestinyRecordDefinition` is one of the largest tables in the manifest and
+only the 99 entries that award a title are kept, and `DestinyPresentationNodeDefinition` is
+read only for the nodes that have a completion record.
+
+Measured on a cold start: **2.1 seconds, about 14 MB retained**, for 36,687 items, 3,744
+activities, 2,118 vendors, 11,002 objectives, 86 progressions and 99 titles. It loads on a
+background thread, so commands work immediately and fall back to single-hash HTTP lookups
+until it arrives.
 
 That is what makes names usable throughout — `/item Gjallarhorn`, `/map kingsfall` — and it
 is what makes the socket features practical at all. A set with twelve items and sixty plugs

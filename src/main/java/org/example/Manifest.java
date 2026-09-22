@@ -11,6 +11,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -37,7 +38,7 @@ final class Manifest {
 
     /** What gets kept for each item: enough to say "Gjallarhorn — Exotic Rocket Launcher". */
     record Item(String name, String type, String tier, long bucketHash, boolean pullHasSideEffects,
-                int itemType) {
+                int itemType, long collectibleHash) {
 
         /** DestinyItemType 26. Bounties expire; quest steps do not. */
         boolean isBounty() {
@@ -65,6 +66,9 @@ final class Manifest {
     private static final String OBJECTIVE_TABLE = "DestinyObjectiveDefinition";
     private static final String MODIFIER_TABLE = "DestinyActivityModifierDefinition";
     private static final String ACTIVITY_TYPE_TABLE = "DestinyActivityTypeDefinition";
+    private static final String PROGRESSION_TABLE = "DestinyProgressionDefinition";
+    private static final String RECORD_TABLE = "DestinyRecordDefinition";
+    private static final String NODE_TABLE = "DestinyPresentationNodeDefinition";
 
     private final BungieClient client;
     private final ManifestCache fallback;
@@ -81,6 +85,11 @@ final class Manifest {
     private volatile Map<Long, long[]> activityPlaces = Map.of();
     private volatile Map<Long, String> modifiers = Map.of();
     private volatile Map<Long, String> activityTypes = Map.of();
+    private volatile Map<Long, Progression> progressions = Map.of();
+    /** Only records that award a title, which is what makes a seal a seal. */
+    private volatile Map<Long, String> titles = Map.of();
+    /** Presentation node hash to the record that completes it, for finding the seals. */
+    private volatile Map<Long, Long> nodeCompletions = Map.of();
     private volatile String version = null;
 
     Manifest(BungieClient client, ManifestCache fallback) {
@@ -122,6 +131,10 @@ final class Manifest {
         Map<Long, String> loadedVendors = readNames(paths.get(VENDOR_TABLE).getAsString());
         Map<Long, String> loadedDestinations = readNames(paths.get(DESTINATION_TABLE).getAsString());
         Map<Long, Objective> loadedObjectives = readObjectives(paths.get(OBJECTIVE_TABLE).getAsString());
+        Map<Long, Progression> loadedProgressions =
+                readProgressions(paths.get(PROGRESSION_TABLE).getAsString());
+        Map<Long, String> loadedTitles = readTitles(paths.get(RECORD_TABLE).getAsString());
+        Map<Long, Long> loadedNodes = readNodeCompletions(paths.get(NODE_TABLE).getAsString());
 
         items = loadedItems;
         activities = loadedActivities;
@@ -133,12 +146,16 @@ final class Manifest {
         activityPlaces = places;
         modifiers = loadedModifiers;
         activityTypes = loadedTypes;
+        progressions = loadedProgressions;
+        titles = loadedTitles;
+        nodeCompletions = loadedNodes;
         version = newVersion;
 
         System.out.println("Manifest " + newVersion + " loaded in "
                 + (System.currentTimeMillis() - started) + "ms: "
                 + loadedItems.size() + " items, " + loadedActivities.size() + " activities, "
-                + loadedVendors.size() + " vendors, " + loadedObjectives.size() + " objectives");
+                + loadedVendors.size() + " vendors, " + loadedObjectives.size() + " objectives, "
+                + loadedProgressions.size() + " progressions, " + loadedTitles.size() + " titles");
     }
 
     // ---------------------------------------------------------------- lookups
@@ -478,6 +495,196 @@ final class Manifest {
         return out;
     }
 
+    // ---------------------------------------------------------------- progressions, titles, seals
+
+    /**
+     * A reputation track: its name and the names of its ranks.
+     *
+     * <p>{@code ranked} is the distinguishing bit. A character carries around a hundred
+     * progressions, most of them internal counters with no display of their own. The ones a
+     * player would call a "rank" — Valor, Infamy, Trials, Iron Banner, the vendor
+     * reputations — are exactly those the manifest gives a {@code rankIcon}, so that flag is
+     * used as the filter rather than a hardcoded list of hashes that would rot every season.
+     */
+    record Progression(String name, boolean ranked, List<String> stepNames) {
+
+        /**
+         * The name of a rank, e.g. "Heroic III", or null when the track has no step names.
+         *
+         * @param stepIndex the zero-based index the API reports, clamped because a maxed
+         *                  track can report one past the end
+         */
+        String stepName(int stepIndex) {
+            if (stepNames.isEmpty()) {
+                return null;
+            }
+            return stepNames.get(Math.max(0, Math.min(stepNames.size() - 1, stepIndex)));
+        }
+
+        int rankCount() {
+            return stepNames.size();
+        }
+    }
+
+    Progression progression(long hash) {
+        return progressions.get(hash);
+    }
+
+    /** The title a record awards, e.g. "Dredgen", or null if it awards none. */
+    String title(long recordHash) {
+        return titles.get(recordHash);
+    }
+
+    /**
+     * Every seal, as presentation node hash to the record that completes it.
+     *
+     * <p>Seals are not a distinct definition type: a seal is a presentation node with a
+     * completion record attached, and the record awards a title. Intersecting those two
+     * conditions is what identifies them without hardcoding a list that changes every
+     * expansion.
+     */
+    Map<Long, Long> seals() {
+        Map<Long, Long> out = new LinkedHashMap<>();
+        for (Map.Entry<Long, Long> entry : nodeCompletions.entrySet()) {
+            if (titles.containsKey(entry.getValue())) {
+                out.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return out;
+    }
+
+    private Map<Long, Progression> readProgressions(String path) throws IOException {
+        Map<Long, Progression> out = new HashMap<>();
+        try (JsonReader reader = open(path)) {
+            reader.beginObject();
+            while (reader.hasNext()) {
+                long hash = Long.parseLong(reader.nextName());
+                String name = null;
+                boolean ranked = false;
+                List<String> steps = new ArrayList<>();
+                reader.beginObject();
+                while (reader.hasNext()) {
+                    switch (reader.nextName()) {
+                        case "displayProperties" -> {
+                            reader.beginObject();
+                            while (reader.hasNext()) {
+                                if ("name".equals(reader.nextName())) {
+                                    name = reader.nextString();
+                                } else {
+                                    reader.skipValue();
+                                }
+                            }
+                            reader.endObject();
+                        }
+                        case "rankIcon" -> ranked = !reader.nextString().isBlank();
+                        case "steps" -> {
+                            reader.beginArray();
+                            while (reader.hasNext()) {
+                                String step = null;
+                                reader.beginObject();
+                                while (reader.hasNext()) {
+                                    if ("stepName".equals(reader.nextName())) {
+                                        step = reader.nextString();
+                                    } else {
+                                        reader.skipValue();
+                                    }
+                                }
+                                reader.endObject();
+                                if (step != null && !step.isBlank()) {
+                                    steps.add(step);
+                                }
+                            }
+                            reader.endArray();
+                        }
+                        default -> reader.skipValue();
+                    }
+                }
+                reader.endObject();
+                if (name != null && !name.isBlank()) {
+                    out.put(hash, new Progression(name, ranked, List.copyOf(steps)));
+                }
+            }
+            reader.endObject();
+        }
+        return out;
+    }
+
+    /**
+     * Record hash to the title it awards.
+     *
+     * <p>The record table is one of the largest in the manifest and almost none of it is
+     * wanted: only the few dozen records that carry a title matter here, so everything
+     * without one is read and discarded.
+     */
+    private Map<Long, String> readTitles(String path) throws IOException {
+        Map<Long, String> out = new HashMap<>();
+        try (JsonReader reader = open(path)) {
+            reader.beginObject();
+            while (reader.hasNext()) {
+                long hash = Long.parseLong(reader.nextName());
+                String title = null;
+                reader.beginObject();
+                while (reader.hasNext()) {
+                    if ("titleInfo".equals(reader.nextName())) {
+                        reader.beginObject();
+                        while (reader.hasNext()) {
+                            if ("titlesByGender".equals(reader.nextName())) {
+                                reader.beginObject();
+                                while (reader.hasNext()) {
+                                    // The two genders give the same English title for every
+                                    // seal in the game; take whichever comes first.
+                                    reader.nextName();
+                                    String value = reader.nextString();
+                                    if (title == null && !value.isBlank()) {
+                                        title = value;
+                                    }
+                                }
+                                reader.endObject();
+                            } else {
+                                reader.skipValue();
+                            }
+                        }
+                        reader.endObject();
+                    } else {
+                        reader.skipValue();
+                    }
+                }
+                reader.endObject();
+                if (title != null) {
+                    out.put(hash, title);
+                }
+            }
+            reader.endObject();
+        }
+        return out;
+    }
+
+    /** Presentation node hash to its completion record, for the nodes that have one. */
+    private Map<Long, Long> readNodeCompletions(String path) throws IOException {
+        Map<Long, Long> out = new HashMap<>();
+        try (JsonReader reader = open(path)) {
+            reader.beginObject();
+            while (reader.hasNext()) {
+                long hash = Long.parseLong(reader.nextName());
+                long completion = 0;
+                reader.beginObject();
+                while (reader.hasNext()) {
+                    if ("completionRecordHash".equals(reader.nextName())) {
+                        completion = reader.nextLong();
+                    } else {
+                        reader.skipValue();
+                    }
+                }
+                reader.endObject();
+                if (completion != 0) {
+                    out.put(hash, completion);
+                }
+            }
+            reader.endObject();
+        }
+        return out;
+    }
+
     private String viaFallback(String table, long hash) {
         try {
             String name = fallback.displayName(table, hash);
@@ -502,6 +709,7 @@ final class Manifest {
                 String type = null;
                 String tier = null;
                 long bucket = 0;
+                long collectible = 0;
                 boolean sideEffects = false;
                 int itemType = 0;
 
@@ -524,6 +732,9 @@ final class Manifest {
                         // destroy something. Worth carrying so the bot can say so first.
                         case "doesPostmasterPullHaveSideEffects" -> sideEffects = reader.nextBoolean();
                         case "itemType" -> itemType = reader.nextInt();
+                        // Present only on items that appear in Collections, which is
+                        // exactly the set worth telling someone they do not own yet.
+                        case "collectibleHash" -> collectible = reader.nextLong();
                         case "inventory" -> {
                             reader.beginObject();
                             while (reader.hasNext()) {
@@ -542,7 +753,7 @@ final class Manifest {
                 reader.endObject();
 
                 if (name != null && !name.isBlank()) {
-                    out.put(hash, new Item(name, type, tier, bucket, sideEffects, itemType));
+                    out.put(hash, new Item(name, type, tier, bucket, sideEffects, itemType, collectible));
                 }
             }
             reader.endObject();

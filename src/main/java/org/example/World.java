@@ -209,14 +209,19 @@ final class World {
      * degrades this to what anyone could see rather than breaking it.
      */
     private JsonArray availableActivities(Store.User user) throws IOException {
-        JsonObject profile = client.profile(user.membershipType, user.membershipId, "204",
+        JsonObject profile = client.profile(user.membershipType, user.membershipId, "200,204",
                 ghost.accessTokenOrNull(user));
+        // Component 200 rides along in the same request, so following the most recently
+        // played character costs nothing extra here.
+        String characterId = ghost.activeCharacter(user,
+                profile.has("characters") ? profile.getAsJsonObject("characters")
+                        .getAsJsonObject("data") : null);
         JsonObject data = profile.has("characterActivities")
                 ? profile.getAsJsonObject("characterActivities").getAsJsonObject("data") : null;
-        if (data == null || !data.has(user.characterId)) {
+        if (data == null || characterId == null || !data.has(characterId)) {
             return new JsonArray();
         }
-        JsonArray available = data.getAsJsonObject(user.characterId)
+        JsonArray available = data.getAsJsonObject(characterId)
                 .getAsJsonArray("availableActivities");
         return available == null ? new JsonArray() : available;
     }

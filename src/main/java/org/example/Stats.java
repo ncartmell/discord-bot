@@ -21,10 +21,10 @@ import java.util.Set;
 /**
  * Historical stats: what you played, how it went, and what you killed it with.
  *
- * <p>All of this reads with the API key alone — no OAuth — which is worth knowing because
- * it means these work for any account whose privacy settings allow it, not just a linked
- * one. They are wired to the linked account here purely because that is whose id the bot
- * already knows.
+ * <p>All of this reads with the API key alone — no OAuth — so every one of these works for
+ * any account whose privacy settings allow it, not only a linked one. Each command therefore
+ * takes an optional Bungie name and falls back to the caller's own account, which is the
+ * common case and the one worth not making people type.
  *
  * <p>Most of these aggregate across all three characters rather than reporting the one the
  * bot happens to be pointed at. "My best weapon" is an account-level question, and getting
@@ -44,16 +44,51 @@ final class Stats {
         this.store = store;
     }
 
+    /**
+     * Whose stats to read.
+     *
+     * <p>{@code label} is null for the caller's own account, which is what lets the embeds
+     * say "across all characters" rather than "across all of your characters" only when
+     * someone else is being looked up.
+     */
+    private record Target(int membershipType, String membershipId, String label) {
+
+        /** A footer suffix naming the player, empty when they are the caller. */
+        String suffix() {
+            return label == null ? "" : " \u00b7 " + label;
+        }
+    }
+
+    /**
+     * Resolves whose stats are wanted: a named player, or the caller's linked account.
+     *
+     * @param bungieName a name like {@code Guardian#1234}, or null for the caller
+     */
+    private Target target(String discordId, String bungieName) throws IOException {
+        if (bungieName == null || bungieName.isBlank()) {
+            Store.User user = store.requireLinked(discordId);
+            return new Target(user.membershipType, user.membershipId, null);
+        }
+        JsonObject account = Destiny.resolveAccount(client, bungieName.trim());
+        return new Target(account.get("membershipType").getAsInt(),
+                account.get("membershipId").getAsString(),
+                Destiny.accountName(account));
+    }
+
+    private static Target of(Store.User user) {
+        return new Target(user.membershipType, user.membershipId, null);
+    }
+
     // ---------------------------------------------------------------- recent activities
 
     /** The last few activities across every character, newest first. */
-    MessageEmbed recent(String discordId, int count) throws IOException {
-        Store.User user = store.requireLinked(discordId);
+    MessageEmbed recent(String discordId, String bungieName, int count) throws IOException {
+        Target target = target(discordId, bungieName);
 
         List<JsonObject> all = new ArrayList<>();
-        for (String characterId : characters(user)) {
-            for (JsonElement element : client.activityHistory(user.membershipType, user.membershipId,
-                    characterId, Math.min(count, 25), 0)) {
+        for (String characterId : characters(target)) {
+            for (JsonElement element : client.activityHistory(target.membershipType(),
+                    target.membershipId(), characterId, Math.min(count, 25), 0)) {
                 all.add(element.getAsJsonObject());
             }
         }
@@ -78,10 +113,10 @@ final class Stats {
         }
 
         return new EmbedBuilder()
-                .setTitle("Recent activities")
+                .setTitle("Recent activities" + title(target))
                 .setColor(ACCENT)
                 .setDescription(String.join("\n", lines))
-                .setFooter("The code after each one is its instance id — pass it to /pgcr")
+                .setFooter("The code after each one is its instance id \u2014 pass it to /pgcr")
                 .build();
     }
 
@@ -92,18 +127,16 @@ final class Stats {
      *
      * @param instanceId the activity to report on, or null for the most recent one
      */
-    MessageEmbed pgcr(String discordId, String instanceId) throws IOException {
-        Store.User user = store.requireLinked(discordId);
-
-        String target = instanceId;
-        if (target == null || target.isBlank()) {
-            target = mostRecentInstanceId(user);
-            if (target == null) {
+    MessageEmbed pgcr(String discordId, String bungieName, String instanceId) throws IOException {
+        String wanted = instanceId;
+        if (wanted == null || wanted.isBlank()) {
+            wanted = mostRecentInstanceId(target(discordId, bungieName));
+            if (wanted == null) {
                 return error("No recent activity to report on.");
             }
         }
 
-        JsonObject report = client.postGameCarnageReport(target.trim());
+        JsonObject report = client.postGameCarnageReport(wanted.trim());
         JsonObject details = report.getAsJsonObject("activityDetails");
         long hash = details == null ? 0 : details.get("referenceId").getAsLong();
 
@@ -149,15 +182,15 @@ final class Stats {
                         + players.size() + (players.size() == 1 ? " player" : " players")
                         + (fromStart ? " · full run" : " · started from a checkpoint"))
                 .addField("Kills / deaths / assists", String.join("\n", lines), false)
-                .setFooter("Instance " + target)
+                .setFooter("Instance " + wanted)
                 .build();
     }
 
     // ---------------------------------------------------------------- clears
 
     /** How many times an activity has been completed, and the fastest one. */
-    MessageEmbed clears(String discordId, String query) throws IOException {
-        Store.User user = store.requireLinked(discordId);
+    MessageEmbed clears(String discordId, String bungieName, String query) throws IOException {
+        Target target = target(discordId, bungieName);
 
         List<Long> wanted = manifest.findActivities(query);
         if (wanted.isEmpty()) {
@@ -169,9 +202,9 @@ final class Stats {
         double fastestMs = 0;
         Map<String, Integer> byName = new HashMap<>();
 
-        for (String characterId : characters(user)) {
-            for (JsonElement element : client.aggregateActivityStats(user.membershipType,
-                    user.membershipId, characterId)) {
+        for (String characterId : characters(target)) {
+            for (JsonElement element : client.aggregateActivityStats(target.membershipType(),
+                    target.membershipId(), characterId)) {
                 JsonObject activity = element.getAsJsonObject();
                 long hash = activity.get("activityHash").getAsLong();
                 if (!wanted.contains(hash)) {
@@ -203,7 +236,7 @@ final class Stats {
                     .setTitle(name)
                     .setColor(ACCENT)
                     .setDescription("Never completed.")
-                    .setFooter("Across all characters")
+                    .setFooter("Across all characters" + target.suffix())
                     .build();
         }
 
@@ -216,7 +249,8 @@ final class Stats {
                 .setTitle(name)
                 .setColor(ACCENT)
                 .setDescription("**" + completions + "** " + (completions == 1 ? "clear" : "clears"))
-                .setFooter("All characters \u00b7 fastest counts checkpoint runs, not just full clears");
+                .setFooter("All characters" + target.suffix()
+                        + " \u00b7 fastest counts checkpoint runs, not just full clears");
         if (fastestMs > 0) {
             embed.addField("Fastest", formatMillis(fastestMs), true);
         }
@@ -240,7 +274,7 @@ final class Stats {
         }
         try {
             int total = 0;
-            for (String characterId : characters(user)) {
+            for (String characterId : characters(of(user))) {
                 for (JsonElement element : client.aggregateActivityStats(user.membershipType,
                         user.membershipId, characterId)) {
                     JsonObject activity = element.getAsJsonObject();
@@ -284,8 +318,8 @@ final class Stats {
     // ---------------------------------------------------------------- weapons
 
     /** Kills and precision kills with one named weapon. */
-    MessageEmbed weapon(String discordId, String query) throws IOException {
-        Store.User user = store.requireLinked(discordId);
+    MessageEmbed weapon(String discordId, String bungieName, String query) throws IOException {
+        Target target = target(discordId, bungieName);
 
         long wanted = manifest.resolveItem(query);
         if (wanted == -1) {
@@ -295,7 +329,7 @@ final class Stats {
         double kills = 0;
         double precision = 0;
         boolean found = false;
-        for (Map.Entry<Long, double[]> entry : weaponTotals(user).entrySet()) {
+        for (Map.Entry<Long, double[]> entry : weaponTotals(target).entrySet()) {
             if (entry.getKey() != wanted
                     && !manifest.itemName(entry.getKey()).equalsIgnoreCase(manifest.itemName(wanted))) {
                 continue;
@@ -310,7 +344,7 @@ final class Stats {
                     .setTitle(manifest.describeItem(wanted))
                     .setColor(ACCENT)
                     .setDescription("No recorded kills with it.")
-                    .setFooter("Stats only cover weapons you've used since they started tracking")
+                    .setFooter("Only covers weapons used since tracking started" + target.suffix())
                     .build();
         }
 
@@ -322,14 +356,14 @@ final class Stats {
         if (kills > 0) {
             embed.addField("Precision rate", Math.round(precision / kills * 100) + "%", true);
         }
-        return embed.setFooter("Across all characters").build();
+        return embed.setFooter("Across all characters" + target.suffix()).build();
     }
 
     /** The weapons with the most kills, across every character. */
-    MessageEmbed topWeapons(String discordId, int count) throws IOException {
-        Store.User user = store.requireLinked(discordId);
+    MessageEmbed topWeapons(String discordId, String bungieName, int count) throws IOException {
+        Target target = target(discordId, bungieName);
 
-        List<Map.Entry<Long, double[]>> ranked = new ArrayList<>(weaponTotals(user).entrySet());
+        List<Map.Entry<Long, double[]>> ranked = new ArrayList<>(weaponTotals(target).entrySet());
         ranked.sort((a, b) -> Double.compare(b.getValue()[0], a.getValue()[0]));
         if (ranked.isEmpty()) {
             return error("No weapon stats on this account.");
@@ -347,7 +381,7 @@ final class Stats {
         }
 
         return new EmbedBuilder()
-                .setTitle("Most used weapons")
+                .setTitle("Most used weapons" + title(target))
                 .setColor(ACCENT)
                 .setDescription(String.join("\n", lines))
                 .setFooter(ranked.size() + " weapons tracked across all characters")
@@ -355,11 +389,11 @@ final class Stats {
     }
 
     /** Kills and precision per weapon hash, summed over every character. */
-    private Map<Long, double[]> weaponTotals(Store.User user) throws IOException {
+    private Map<Long, double[]> weaponTotals(Target target) throws IOException {
         Map<Long, double[]> totals = new HashMap<>();
-        for (String characterId : characters(user)) {
-            for (JsonElement element : client.uniqueWeapons(user.membershipType, user.membershipId,
-                    characterId)) {
+        for (String characterId : characters(target)) {
+            for (JsonElement element : client.uniqueWeapons(target.membershipType(),
+                    target.membershipId(), characterId)) {
                 JsonObject weapon = element.getAsJsonObject();
                 if (!weapon.has("referenceId")) {
                     continue;
@@ -377,21 +411,23 @@ final class Stats {
     // ---------------------------------------------------------------- helpers
 
     /** Every character on the account, so stats are not silently limited to one. */
-    private List<String> characters(Store.User user) throws IOException {
-        JsonObject profile = client.profile(user.membershipType, user.membershipId, "200");
+    private List<String> characters(Target target) throws IOException {
+        JsonObject profile = client.profile(target.membershipType(), target.membershipId(), "200");
         JsonObject characters = profile.has("characters")
                 ? profile.getAsJsonObject("characters").getAsJsonObject("data") : null;
-        if (characters == null) {
-            return user.characterId == null ? List.of() : List.of(user.characterId);
-        }
-        return new ArrayList<>(characters.keySet());
+        return characters == null ? List.of() : new ArrayList<>(characters.keySet());
     }
 
-    private String mostRecentInstanceId(Store.User user) throws IOException {
+    /** " — Guardian#1234" when someone else is being looked up, empty for the caller. */
+    private static String title(Target target) {
+        return target.label() == null ? "" : " \u2014 " + target.label();
+    }
+
+    private String mostRecentInstanceId(Target target) throws IOException {
         JsonObject newest = null;
-        for (String characterId : characters(user)) {
-            JsonArray history = client.activityHistory(user.membershipType, user.membershipId,
-                    characterId, 1, 0);
+        for (String characterId : characters(target)) {
+            JsonArray history = client.activityHistory(target.membershipType(),
+                    target.membershipId(), characterId, 1, 0);
             if (history.isEmpty()) {
                 continue;
             }
